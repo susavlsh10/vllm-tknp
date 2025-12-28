@@ -22,7 +22,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only LLaMA model compatible with HuggingFace weights. Token Parallel Experiments"""
+"""Inference-only LLaMA model compatible with HuggingFace weights."""
+
 from collections.abc import Iterable
 from itertools import islice
 
@@ -35,8 +36,7 @@ from vllm.attention.layer import Attention
 from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
-
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -56,7 +56,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.logger import init_logger
 
 from .adapters import as_embedding_model, as_seq_cls_model
 from .interfaces import (
@@ -75,34 +74,7 @@ from .utils import (
     maybe_prefix,
 )
 
-logger = init_logger(__name__)
 
-
-'''
-Summary of changes: 
-1. RMSNorm, VocabParallelEmbedding, ParallelLMHead are updated with init_tknp_layer decorator
-2. QKVLinear and RowLinear in Attention are replaced with TokenParallelQKVLinear and TokenParallelRowLinear
-3. The MLP class is decorated with init_tknp_layer
-4. The load_weights function in LlamaForCausalLM is updated to handle token parallelism loading
-'''
-
-
-# Token parallel imports
-from vllm.model_executor.layers.token_parallel_linear import TokenParallelQKVLinear, TokenParallelRowLinear, init_tknp_layer
-
-from vllm.distributed.parallel_state import (
-    get_tknp_rank, 
-    get_tknp_world_size, 
-    get_tknp_group, 
-    is_tknp_initialized,
-    is_root_rank,
-)
-
-RMSNorm = init_tknp_layer(RMSNorm)
-VocabParallelEmbedding = init_tknp_layer(VocabParallelEmbedding)
-ParallelLMHead = init_tknp_layer(ParallelLMHead)
-
-@init_tknp_layer
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -145,6 +117,7 @@ class LlamaMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+
 class LlamaAttention(nn.Module):
     def __init__(
         self,
@@ -162,11 +135,8 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
-        self.layer_idx = layer_idx
-        
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -198,7 +168,7 @@ class LlamaAttention(nn.Module):
             )
             self.llama_4_scaling_beta = llama_4_scaling_config["beta"]
 
-        self.qkv_proj = TokenParallelQKVLinear(
+        self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
@@ -208,7 +178,7 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
 
-        self.o_proj = TokenParallelRowLinear(
+        self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias_o_proj,
@@ -273,19 +243,14 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-
         qkv, _ = self.qkv_proj(hidden_states)
-        if qkv.shape[0] > 0:   
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.rotary_emb(positions, q, k)
-            if self.do_llama_4_scaling:
-                attn_scale = self._get_llama_4_attn_scale(positions)
-                q = (q * attn_scale).to(q.dtype)
-            attn_output = self.attn(q, k, v)
-        else:
-            attn_output = torch.empty((0, self.total_num_heads * self.head_dim), dtype=qkv.dtype, device=qkv.device)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        if self.do_llama_4_scaling:
+            attn_scale = self._get_llama_4_attn_scale(positions)
+            q = (q * attn_scale).to(q.dtype)
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-
         return output
 
     def _init_rotary_emb(
@@ -330,8 +295,6 @@ class LlamaDecoderLayer(nn.Module):
         # support internlm/internlm3-8b with qkv_bias
         if hasattr(config, "qkv_bias"):
             attention_bias = config.qkv_bias
-            
-        self.prefix = prefix
 
         # By default, Llama uses causal attention as it is a decoder-only model.
         # You can override the HF config with `is_causal=False` to enable
@@ -387,7 +350,6 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
@@ -423,7 +385,6 @@ class LlamaModel(nn.Module):
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
 
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -471,11 +432,7 @@ class LlamaModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        
-        # TKNP
-        _num_tokens, _ = hidden_states.shape
-        dtype, device = hidden_states.dtype, hidden_states.device
-        
+
         aux_hidden_states = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
@@ -493,12 +450,6 @@ class LlamaModel(nn.Module):
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
-        
-        # TKNP
-        if is_tknp_initialized() and get_tknp_rank() != 0:
-            # hidden_states needs to be of the shape [batch_size, seq_len, hidden_dim] in all ranks
-            hidden_states = torch.zeros(_num_tokens, self.hidden_size, dtype=dtype, device=device)
-
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -632,9 +583,7 @@ class LlamaForCausalLM(
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             if config.tie_word_embeddings:
-                if not is_tknp_initialized() or is_root_rank():
-                    self.lm_head = self.lm_head.tie_weights(
-                        self.model.embed_tokens)
+                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
             logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
@@ -689,12 +638,7 @@ class LlamaForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
-        # Early return for non-root ranks in token parallel groups
-        if is_tknp_initialized() and get_tknp_rank() != 0:
-            return set()
-    
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),

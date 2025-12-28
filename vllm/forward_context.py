@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Optional
 
 import torch
 
@@ -23,6 +23,28 @@ last_logging_time: float = 0
 forward_start_time: float = 0
 batchsize_logging_interval: float = envs.VLLM_LOG_BATCHSIZE_INTERVAL
 batchsize_forward_time: defaultdict = defaultdict(list)
+
+@dataclass
+class TokenParallelMetadata:
+    """Metadata for layers using Token Parallelism."""
+
+    num_reqs: int
+    num_actual_tokens: Optional[int] = None
+    stage: str = "prefill"
+    tknp_enabled: bool = False
+    tknp_rank: Optional[int] = None
+    token_parallel_world_size: int = 1
+    tokens_per_rank: Optional[list[int]] = None
+    rank_start_loc: Optional[list[int]] = None
+    rank_end_loc: Optional[list[int]] = None
+    request_to_rank: Optional[list[int]] = None
+    rank_request_indices: Optional[list[list[int]]] = None
+    rank_token_spans: Optional[list[list[tuple[int, int]]]] = None
+    local_query_start_loc: Optional[torch.Tensor] = None
+    local_seq_lens: Optional[torch.Tensor] = None
+    local_num_tokens: Optional[int] = None
+    root_rank: int = 0
+    _dummy_run: bool = False
 
 
 class BatchDescriptor(NamedTuple):
@@ -204,6 +226,9 @@ class ForwardContext:
     batch_descriptor: BatchDescriptor | None = None
 
     ubatch_slices: UBatchSlices | None = None
+    
+    # TKNP
+    tknp_metadata: Optional[TokenParallelMetadata] = None
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
@@ -235,6 +260,7 @@ def create_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    tknp_metadata: Optional[TokenParallelMetadata] = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -244,6 +270,7 @@ def create_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
+        tknp_metadata=tknp_metadata,
     )
 
 
@@ -272,6 +299,7 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    tknp_metadata: Optional[TokenParallelMetadata] = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -317,6 +345,7 @@ def set_forward_context(
         cudagraph_runtime_mode,
         batch_descriptor,
         ubatch_slices,
+        tknp_metadata,
     )
 
     try:

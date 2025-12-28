@@ -273,6 +273,12 @@ class ParallelConfig:
         This is an internal config that is only valid for and
         should only be set by API server scale-out.
     """
+    
+    # New fields for TKNP
+    token_parallel_size: int = 1
+    """Number of token parallel groups for attention layers."""
+    enable_token_parallel: bool = False
+    """Enable token parallelism for attention layers."""
 
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
@@ -506,12 +512,31 @@ class ParallelConfig:
             )
             self.all2all_backend = envs.VLLM_ALL2ALL_BACKEND
 
+        # Token parallel validation - token parallelism and data parallelism are mutually exclusive
+        if self.enable_token_parallel:
+            if self.token_parallel_size <= 1:
+                raise ValueError(
+                    "Token parallelism requires token_parallel_size > 1")
+            if self.data_parallel_size > 1:
+                raise ValueError(
+                    "Token parallelism is incompatible with data parallelism. "
+                    "Set data_parallel_size=1 when using token parallelism.")
+            logger.info(
+                f"Token parallelism enabled with token_parallel_size={self.token_parallel_size}")
+        
+
         # Continue with the rest of the initialization
-        self.world_size = (
-            self.pipeline_parallel_size
-            * self.tensor_parallel_size
-            * self.prefill_context_parallel_size
-        )
+        # Calculate world size considering token parallelism. prefill_context_parallel_size not used with token parallelism.
+        if self.enable_token_parallel:
+            self.world_size = (self.pipeline_parallel_size * 
+                              self.tensor_parallel_size * 
+                              self.token_parallel_size)
+        else:
+            self.world_size = (
+                self.pipeline_parallel_size
+                * self.tensor_parallel_size
+                * self.prefill_context_parallel_size
+            )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
