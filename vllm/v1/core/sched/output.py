@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING
 from typing_extensions import deprecated
 
 from vllm._bc_linter import bc_linter_include
+import numpy.typing as npt
+import numpy as np
 
 if TYPE_CHECKING:
-    import numpy as np
-    import numpy.typing as npt
     import torch
 
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
@@ -105,6 +105,14 @@ class NewRequestData:
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
         )
+
+@dataclass
+class TokenParallelAllocation:
+    """Assignment of scheduled tokens to token-parallel ranks."""
+
+    req_to_tknp_rank: dict[str, int]
+    tknp_tokens_per_rank_cache: npt.NDArray[np.int32]
+    tknp_reqs_per_rank: npt.NDArray[np.int32]
 
 
 @bc_linter_include
@@ -206,6 +214,9 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+    
+    # Token Parallel Allocation
+    token_parallel_allocations: TokenParallelAllocation | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

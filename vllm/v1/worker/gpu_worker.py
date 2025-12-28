@@ -31,7 +31,8 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_tp_group,
-)
+    get_tknp_group,
+) 
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -64,6 +65,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm.distributed.parallel_state import (
+    _print_worker_rank_info,
+)
 
 class Worker(WorkerBase):
     def __init__(
@@ -959,3 +963,5 @@ def init_worker_distributed_environment(
     # Init ec connector here before KV caches caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)
+    
+    # _print_worker_rank_info(rank)   # TKNP, print rank information

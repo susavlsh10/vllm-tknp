@@ -29,6 +29,8 @@ logger = init_logger(__name__)
 
 _R = TypeVar("_R")
 
+from vllm.distributed.parallel_state import is_tknp_initialized
+
 FailureCallback = Callable[[], None]
 
 

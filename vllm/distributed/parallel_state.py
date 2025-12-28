@@ -1127,6 +1127,77 @@ def get_pcp_group() -> GroupCoordinator:
     return _PCP
 
 
+# Token parallel group (TKNP)
+_TKNP: Optional[GroupCoordinator] = None
+
+def get_tknp_group() -> GroupCoordinator:
+    """Get the token parallel group."""
+    assert _TKNP is not None, (
+        "Token parallel group is not initialized")
+    return _TKNP
+
+def get_tknp_rank() -> int:
+    """Get rank in token parallel group."""
+    if not is_tknp_initialized():
+        return 0
+    return get_tknp_group().rank_in_group
+
+def get_tknp_world_size() -> int:
+    """Get world size of token parallel group."""
+    return get_tknp_group().world_size
+
+def is_tknp_initialized() -> bool:
+    """Check if token parallel is initialized."""
+    return _TKNP is not None
+
+def is_root_rank() -> bool:
+    """Check if the current rank is the root rank (rank 0) in the token parallel world group. 
+        If token parallel is not initialized, always return True. 
+    """
+    
+    if not is_tknp_initialized():
+        return True
+    return get_tknp_rank() == 0
+
+def _print_worker_rank_info(rank: int) -> None:
+    """Print rank information for this worker process."""
+    import os
+    from vllm.distributed.parallel_state import (
+        get_tp_group, get_pp_group, get_dp_group
+    )
+    global_rank = torch.distributed.get_rank()
+    
+    logger.info(f"Worker Rank {global_rank} (PID: {os.getpid()}) - Parallel Groups:")
+    
+    # Print tensor parallel group ranks
+    try:
+        tp_group = get_tp_group()
+        logger.info(f"Rank {global_rank}: Tensor Parallel: {sorted(tp_group.ranks)}")
+    except (AssertionError, AttributeError):
+        logger.info(f"Rank {global_rank}: Tensor Parallel: Not initialized")
+
+    # Print pipeline parallel group ranks
+    try:
+        pp_group = get_pp_group()
+        logger.info(f"Rank {global_rank}: Pipeline Parallel: {sorted(pp_group.ranks)}")
+    except (AssertionError, AttributeError):
+        logger.info(f"Rank {global_rank}: Pipeline Parallel: Not initialized")
+
+    # Print data parallel group ranks
+    try:
+        dp_group = get_dp_group()
+        logger.info(f"Rank {global_rank}: Data Parallel: {sorted(dp_group.ranks)}")
+    except (AssertionError, AttributeError):
+        logger.info(f"Rank {global_rank}: Data Parallel: Not initialized")
+
+    # Print token parallel group ranks
+    try:
+        tknp_group = get_tknp_group()
+        logger.info(f"Rank {global_rank}: Token Parallel: {sorted(tknp_group.ranks)}")
+    except (AssertionError, AttributeError):
+        logger.info(f"Rank {global_rank}: Token Parallel: Not initialized")
+
+
 @contextmanager
 def graph_capture(device: torch.device):
     """
@@ -1291,6 +1362,8 @@ def initialize_model_parallel(
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
         backend: name of torch distributed communication backend.
+        token_model_parallel_size: number of GPUs used for token model
+            parallelism (new).
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1311,12 +1384,23 @@ def initialize_model_parallel(
     rank = torch.distributed.get_rank()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    data_parallel_size = 1
+    # Get configuration
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
-    if config is not None:
-        data_parallel_size = config.parallel_config.data_parallel_size
+    
+    # Determine if token parallelism is enabled
+    enable_tknp = (config is not None and 
+                  config.parallel_config.enable_token_parallel and
+                  config.parallel_config.token_parallel_size > 1)
+
+    if enable_tknp:
+        data_parallel_size = 1  # Force DP size to 1 for token parallelism
+        token_parallel_size = config.parallel_config.token_parallel_size
+        logger.info(f"Token parallelism enabled: token_parallel_size={token_parallel_size}")
+    else:
+        data_parallel_size = config.parallel_config.data_parallel_size if config else 1
+        token_parallel_size = 1
 
     # the layout order is: ExternalDP x DP x PP x TP
     # ExternalDP is the data parallel group that is not part of the model,
@@ -1327,9 +1411,15 @@ def initialize_model_parallel(
     # otherwise it will cause deadlock.
     # to get group_ranks for each dimension, transpose that dimension to the
     # last dimension, then reshape to 2D, then unbind the last dimension
+    # Layout: ExternalDP x (DP|TKNP) x PP x TP
+    
+    model_data_parallel_size = (
+        token_parallel_size if enable_tknp else data_parallel_size
+    )
+    
     all_ranks = torch.arange(world_size).reshape(
         -1,
-        data_parallel_size,
+        model_data_parallel_size,
         pipeline_model_parallel_size,
         prefill_context_model_parallel_size,
         tensor_model_parallel_size,
@@ -1390,44 +1480,72 @@ def initialize_model_parallel(
         group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
 
+    # Build token parallel groups OR data parallel groups
     global _DP
-    assert _DP is None, "data parallel group is already initialized"
-    group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-    _DP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="dp"
-    )
+    if enable_tknp:
+        # Create token parallel groups
+        global _TKNP
+        assert _TKNP is None, (
+            "Token parallel group is already initialized")
+        group_ranks = all_ranks.transpose(1, 4).reshape(
+            -1, token_parallel_size).unbind(0)
+        group_ranks = [x.tolist() for x in group_ranks]
+        _TKNP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="tknp")
+        
+        # Still create DP groups with size 1 for compatibility
+        assert _DP is None, ("data parallel group is already initialized")
+        # Each rank is its own DP group when token parallelism is enabled
+        group_ranks = [[i] for i in range(world_size)]
+        _DP = init_model_parallel_group(group_ranks,
+                                        get_world_group().local_rank,
+                                        backend,
+                                        group_name="dp")
+    else:
+        # Standard data parallel groups
+        assert _DP is None, ("data parallel group is already initialized")
+        group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
+        group_ranks = [x.tolist() for x in group_ranks]
+        _DP = init_model_parallel_group(
+            group_ranks, get_world_group().local_rank, backend, group_name="dp"
+        )
 
+    # Build expert parallel groups (modified for token parallelism)
+    # TODO: Revisit this for MoE and token parallelism integration.
     global _EP
     assert _EP is None, "expert parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(1, 2)
-        .reshape(
-            -1,
-            data_parallel_size
-            * prefill_context_model_parallel_size
-            * tensor_model_parallel_size,
+    if enable_tknp:
+        # EP groups span TP x TKNP when token parallelism is enabled
+        group_ranks = all_ranks.transpose(1, 2).reshape(
+            -1, token_parallel_size * tensor_model_parallel_size
+        ).unbind(0)
+    else:
+        group_ranks = (
+            all_ranks.transpose(1, 2)
+            .reshape(
+                -1,
+                data_parallel_size
+                * prefill_context_model_parallel_size
+                * tensor_model_parallel_size,
+            )
+            .unbind(0)
         )
-        .unbind(0)
-    )
     group_ranks = [x.tolist() for x in group_ranks]
     _EP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="ep"
     )
 
-    logger.info_once(
-        "rank %s in world size %s is assigned as "
-        "DP rank %s, PP rank %s, PCP rank %s, "
-        "TP rank %s, EP rank %s",
-        rank,
-        world_size,
-        _DP.rank_in_group,
-        _PP.rank_in_group,
-        _PCP.rank_in_group,
-        _TP.rank_in_group,
-        _EP.rank_in_group,
-    )
+    model_data_parallel_rank_in_group = _TKNP.rank_in_group if is_tknp_initialized() else _DP.rank_in_group
 
+    logger.info(
+        "rank %s in world size %s is assigned as "
+        "DP/TKNP rank %s, PP rank %s, TP rank %s, EP rank %s", rank, world_size,
+        model_data_parallel_rank_in_group, _PP.rank_in_group, _TP.rank_in_group,
+        _EP.rank_in_group
+    )
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
@@ -1580,6 +1698,11 @@ def destroy_model_parallel():
     if _EP:
         _EP.destroy()
     _EP = None
+    
+    global _TKNP
+    if _TKNP:
+        _TKNP.destroy()
+    _TKNP = None
 
 
 def destroy_distributed_environment():

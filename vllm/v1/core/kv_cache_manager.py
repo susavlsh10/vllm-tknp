@@ -17,6 +17,7 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+from vllm.distributed.parallel_state import get_tknp_rank
 
 @dataclass
 class KVCacheBlocks:
@@ -161,7 +162,9 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(self,
+                            request: Request,
+                            tknp_skip_caching: bool = False) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -177,7 +180,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        if not self.enable_caching or request.skip_reading_prefix_cache or tknp_skip_caching:
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -212,6 +215,7 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        tknp_skip_allocation: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -233,6 +237,8 @@ class KVCacheManager:
             num_encoder_tokens: The number of encoder tokens to allocate for
                 cross-attention in encoder-decoder models(e.g., Whisper).
                 For decoder-only models, this should be 0.
+            tknp_skip_allocation: Whether to skip allocation for token parallelism.
+                This is used when the current rank is not assigned to the request.
 
         Blocks layout:
         ```
@@ -251,6 +257,10 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        
+        if tknp_skip_allocation:
+            return self.create_empty_block_list()
+        
         if num_new_tokens == 0:
             raise ValueError("num_new_tokens must be greater than 0")
 
@@ -417,3 +427,8 @@ class KVCacheManager:
     ) -> KVCacheBlocks:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
+
+    def create_empty_block_list(self) -> KVCacheBlocks:
+        """Creates a new KVCacheBlocks instance with no blocks."""
+        return KVCacheBlocks(tuple([]
+                                for _ in range(self.num_kv_cache_groups)))

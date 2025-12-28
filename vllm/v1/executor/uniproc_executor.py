@@ -19,6 +19,7 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
+from vllm.distributed.parallel_state import is_tknp_initialized
 
 logger = init_logger(__name__)
 
@@ -182,5 +183,6 @@ class ExecutorWithExternalLauncher(UniProcExecutor):
 
         cpu_group = get_world_group().cpu_group
         memory_tensor = torch.tensor([memory], device="cpu", dtype=torch.int64)
-        dist.all_reduce(memory_tensor, group=cpu_group, op=dist.ReduceOp.MIN)
+        if not is_tknp_initialized():
+            dist.all_reduce(memory_tensor, group=cpu_group, op=dist.ReduceOp.MIN)
         return [memory_tensor.item()]

@@ -405,6 +405,9 @@ class EngineArgs:
     data_parallel_hybrid_lb: bool = False
     data_parallel_external_lb: bool = False
     data_parallel_backend: str = ParallelConfig.data_parallel_backend
+    # Token parallel configs
+    token_parallel_size: int = ParallelConfig.token_parallel_size
+    enable_token_parallel: bool = ParallelConfig.enable_token_parallel
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     all2all_backend: str = ParallelConfig.all2all_backend
     enable_dbo: bool = ParallelConfig.enable_dbo
@@ -881,7 +884,14 @@ class EngineArgs:
         parallel_group.add_argument(
             "--worker-extension-cls", **parallel_kwargs["worker_extension_cls"]
         )
-
+        # Token parallel arguments
+        parallel_group.add_argument(
+            "--enable-token-parallel",
+            **parallel_kwargs["enable_token_parallel"])
+        parallel_group.add_argument(
+            "--token-parallel-size",
+            **parallel_kwargs["token_parallel_size"])
+        
         # KV cache arguments
         cache_kwargs = get_kwargs(CacheConfig)
         cache_group = parser.add_argument_group(
@@ -1592,6 +1602,8 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
+            enable_token_parallel=self.enable_token_parallel,
+            token_parallel_size=self.token_parallel_size,
         )
 
         speculative_config = self.create_speculative_config(

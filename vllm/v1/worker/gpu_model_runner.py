@@ -180,6 +180,15 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
+from vllm.distributed.parallel_state import (
+    get_tknp_rank, 
+    get_tknp_world_size, 
+    get_tknp_group, 
+    is_tknp_initialized,
+    is_root_rank,
+)
+
+from vllm.forward_context import TokenParallelMetadata
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -605,6 +614,232 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
+        
+        # TKNP
+        self.root_rank = is_root_rank()
+
+    def _build_token_parallel_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+        total_num_scheduled_tokens: int,
+    ) -> TokenParallelMetadata:
+        """
+        Build token parallel metadata using cached rank assignments.
+        
+        Args:
+            scheduler_output: The scheduler output.
+            total_num_scheduled_tokens: Total number of scheduled tokens.
+            
+        Returns:
+            TokenParallelMetadata with rank assignments.
+        """
+        stage = "mixed" # vllm batches both prefill and decode together
+        tokens_per_rank = scheduler_output.token_parallel_allocations.tknp_tokens_per_rank_cache
+        rank = get_tknp_rank()
+
+        return TokenParallelMetadata(
+            num_reqs=self.input_batch.num_reqs,
+            num_actual_tokens=total_num_scheduled_tokens,
+            stage=stage,
+            tknp_enabled=True,
+            tknp_rank=rank,
+            token_parallel_world_size=get_tknp_world_size(),
+            tokens_per_rank=tokens_per_rank,
+            local_num_tokens=tokens_per_rank[rank],
+        )
+        
+    def _tknp_out_sync(self, sampler_output, async_op: bool = True):
+        """Broadcast sampled token ids from root rank to all TKNP ranks.
+        Args:
+            sampler_output: Sampler output containing sampled token ids.
+            async_op (bool): Whether to perform the broadcast asynchronously.
+        Returns:
+            work: The work handle for the asynchronous broadcast.
+        """
+
+        sampled_token_ids_to_broadcast = sampler_output.sampled_token_ids
+        # Broadcast from root rank (rank 0) to all TKNP ranks
+        
+        work = torch.distributed.broadcast(
+            sampled_token_ids_to_broadcast,
+            src=0,  # Root rank
+            group=get_tknp_group().device_group,
+            async_op=async_op  # Make it asynchronous!
+        )
+        
+        # Update sampler_output with broadcasted tokens
+        sampler_output.sampled_token_ids = sampled_token_ids_to_broadcast
+        
+        # # Store the work handle so we can wait later if needed
+        return work
+
+    # works better, fixes continuous batching 
+    def _tknp_slicing(self, 
+                      scheduler_output: "SchedulerOutput",
+                      attn_metadata: dict[str, Any],
+                      tknp_metadata: TokenParallelMetadata,
+                      positions: torch.Tensor,):
+        """Slice attention metadata, positions tensor for token parallelism.
+        Selects the appropriate slices of attention metadata and positions from the full tensors.
+        TODO: This might not be the most efficient approach, revisit after KV cache optimization.
+
+        Args:
+            attn_metadata (dict): Dictionary mapping layer names to FlashAttentionMetadata
+            tknp_metadata (TokenParallelMetadata): Token parallel metadata with rank assignments
+            positions (torch.Tensor): The complete positions tensors for all requests
+        """
+        rank = tknp_metadata.tknp_rank
+        num_actual_tokens = tknp_metadata.local_num_tokens.item()
+        tokens_per_rank = tknp_metadata.tokens_per_rank
+        
+        # global sequence lengths
+        key_0 = next(iter(attn_metadata.keys()))
+        global_seq_lens = attn_metadata[key_0].seq_lens  # Get from any layer
+        
+        # Get request-to-rank mapping
+        req_to_rank = {}
+        for req_id, req_rank in scheduler_output.token_parallel_allocations.req_to_tknp_rank.items():
+            req_to_rank[req_id] = req_rank
+        
+        # Map request indices to ranks
+        req_ids = self.input_batch.req_ids
+        local_req_indices = []
+        global_to_local_req_map = {}
+        
+        for global_idx, req_id in enumerate(req_ids):
+            if req_to_rank.get(req_id, 0) == rank:
+                local_req_indices.append(global_idx)
+                global_to_local_req_map[global_idx] = len(local_req_indices) - 1
+        
+        if not local_req_indices:
+            # This rank has no requests assigned
+            # Return empty metadata
+            for layer_name, metadata in attn_metadata.items():
+                metadata.num_actual_tokens = 0
+                metadata.query_start_loc = torch.zeros(1, dtype=torch.int32, device=metadata.query_start_loc.device)
+                metadata.max_seq_len = 0
+                metadata.num_reqs = 0
+                metadata.seq_lens = torch.zeros(0, dtype=torch.int32, device=metadata.seq_lens.device)
+                metadata.slot_mapping = torch.zeros(0, dtype=torch.int64, device=metadata.slot_mapping.device)
+                metadata.block_table = torch.zeros(0, metadata.block_table.size(1), dtype=metadata.block_table.dtype, device=metadata.block_table.device)
+            
+            return attn_metadata, torch.zeros(0, dtype=positions.dtype, device=positions.device)
+        
+        # Get local sequence information
+        local_seq_lens = global_seq_lens[local_req_indices].contiguous()
+        
+        # Calculate token ranges for this rank
+        # We need to find which tokens belong to this rank
+        num_scheduled_tokens = np.array([
+            scheduler_output.num_scheduled_tokens[req_id] 
+            for req_id in req_ids
+        ], dtype=np.int32)
+        
+        # Calculate cumulative token positions for all requests
+        cu_tokens = np.concatenate(([0], np.cumsum(num_scheduled_tokens)))
+        
+        # Find which tokens belong to this rank's requests
+        local_token_mask = np.zeros(cu_tokens[-1], dtype=bool)
+        for local_idx, global_idx in enumerate(local_req_indices):
+            start_tok = cu_tokens[global_idx]
+            end_tok = cu_tokens[global_idx + 1]
+            local_token_mask[start_tok:end_tok] = True
+        
+        # Get the actual token indices for this rank
+        local_token_indices = np.where(local_token_mask)[0]
+        
+        # Verify the number of tokens matches
+        assert len(local_token_indices) == num_actual_tokens, \
+            f"Token count mismatch: expected {num_actual_tokens}, got {len(local_token_indices)}"
+        
+        # Create new query start locations
+        local_num_scheduled_tokens = num_scheduled_tokens[local_req_indices]
+        new_query_start_locs = torch.cumsum(
+            torch.cat([
+                torch.tensor([0], device=local_seq_lens.device), 
+                torch.from_numpy(local_num_scheduled_tokens).to(local_seq_lens.device)
+            ]), 
+            dim=0,
+            dtype=torch.int32
+        )
+        
+        new_max_seq_len = local_seq_lens.max().item() if len(local_seq_lens) > 0 else 0
+        new_num_reqs = len(local_req_indices)
+        
+        # Slice position tensor
+        positions = positions[local_token_indices].contiguous()
+        
+        # Update metadata for all layers
+        processed_metadata_ids = set()
+        for layer_name, metadata in attn_metadata.items():
+            metadata_id = id(metadata)
+
+            if metadata_id not in processed_metadata_ids:
+                # Update metadata
+                metadata.num_actual_tokens = num_actual_tokens
+                metadata.query_start_loc = new_query_start_locs
+                metadata.max_seq_len = new_max_seq_len
+                metadata.num_reqs = new_num_reqs
+                metadata.seq_lens = local_seq_lens
+                
+                # Slice slot mappings
+                new_slot_mapping = metadata.slot_mapping[local_token_indices].contiguous()
+                metadata.slot_mapping = new_slot_mapping
+                
+                # Slice block tables
+                new_block_table = metadata.block_table[local_req_indices].contiguous()
+                metadata.block_table = new_block_table
+                
+                processed_metadata_ids.add(metadata_id)
+                
+        return attn_metadata, positions
+    
+    def _tknp_dummy_setup(self, num_tokens: int, num_reqs: int, positions: torch.Tensor): 
+        world_size = get_tknp_world_size()
+        rank = get_tknp_rank()
+        base = num_tokens // world_size
+        remainder = num_tokens % world_size
+        tokens_per_rank = [
+            base + (1 if r < remainder else 0) for r in range(world_size)
+        ]
+        rank_start_loc: list[int] = []
+        rank_end_loc: list[int] = []
+        offset = 0
+        for count in tokens_per_rank:
+            rank_start_loc.append(offset)
+            offset += count
+            rank_end_loc.append(offset)
+        local_start = rank_start_loc[rank]
+        local_end = rank_end_loc[rank]
+
+        if self.uses_mrope:
+            positions = positions[:, local_start:local_end]
+        else:
+            positions = positions[local_start:local_end]
+
+        request_to_rank = [idx % world_size for idx in range(num_reqs)]
+        rank_request_indices = [[] for _ in range(world_size)]
+        for idx, r in enumerate(request_to_rank):
+            rank_request_indices[r].append(idx)
+
+        tknp_metadata = TokenParallelMetadata(
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            stage="prefill",
+            tknp_enabled=True,
+            tknp_rank=rank,
+            token_parallel_world_size=world_size,
+            tokens_per_rank=tokens_per_rank,
+            rank_start_loc=rank_start_loc,
+            rank_end_loc=rank_end_loc,
+            request_to_rank=request_to_rank,
+            rank_request_indices=rank_request_indices,
+            rank_token_spans=[[] for _ in range(world_size)],
+            local_num_tokens=tokens_per_rank[rank],
+            _dummy_run=True,
+        )
+        
+        return tknp_metadata, positions
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2600,6 +2835,10 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
+        
+        # TKNP
+        if is_tknp_initialized():
+            self._tknp_out_sync(sampler_output, async_op=False)
         self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
 
@@ -3121,6 +3360,16 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            
+            if is_tknp_initialized() and get_tknp_world_size() > 1:
+                tknp_metadata = self._build_token_parallel_metadata(
+                    scheduler_output,
+                    int(scheduler_output.total_num_scheduled_tokens),
+                )
+                # tknp slicing
+                attn_metadata, positions = self._tknp_slicing(scheduler_output, attn_metadata, tknp_metadata, positions)
+            else:
+                tknp_metadata = None
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3141,6 +3390,7 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                tknp_metadata=tknp_metadata,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -4185,6 +4435,7 @@ class GPUModelRunner(
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
+        tknp_metadata: TokenParallelMetadata | None = None
 
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
@@ -4244,6 +4495,9 @@ class GPUModelRunner(
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
                 positions = self.positions.gpu[:num_tokens_padded]
+                
+            if is_tknp_initialized():
+                tknp_metadata, positions = self._tknp_dummy_setup(num_tokens, num_reqs, positions)
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -4279,6 +4533,7 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    tknp_metadata=tknp_metadata if is_tknp_initialized() else None,
                 ),
             ):
                 outputs = self.model(
@@ -4362,6 +4617,9 @@ class GPUModelRunner(
         if supports_mm_encoder_only(self.model):
             # MM Encoder only model no need to run sampler.
             return torch.tensor([])
+        
+        if not self.root_rank:
+            return None
 
         hidden_states = torch.rand_like(hidden_states)
 
@@ -4569,7 +4827,7 @@ class GPUModelRunner(
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and self.root_rank: # TKNP
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
             else:
