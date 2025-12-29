@@ -93,7 +93,8 @@ dzdo docker exec -it vllm-run bash
 VLLM_USE_PRECOMPILED=1 pip install --editable .
 ```
 
-vllm base commit : 5f0af36af555a3813b9d30983bd29c384b84b647
+# new commit 
+vllm base commit : f1531d9f2a60c347ea1b410bfb04850c92922de0
 
 ```bash
 # use full commit hash from the main branch
