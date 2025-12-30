@@ -283,7 +283,7 @@ class LlamaAttention(nn.Module):
                 q = (q * attn_scale).to(q.dtype)
             attn_output = self.attn(q, k, v)
         else:
-            attn_output = torch.empty((0, self.total_num_heads * self.head_dim), dtype=qkv.dtype, device=qkv.device)
+            attn_output = torch.empty((0, self.num_heads * self.head_dim), dtype=qkv.dtype, device=qkv.device)
         output, _ = self.o_proj(attn_output)
 
         return output

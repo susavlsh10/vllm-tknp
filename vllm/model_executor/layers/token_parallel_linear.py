@@ -230,7 +230,7 @@ class TokenParallelQKVLinear(QKVParallelLinear):
         dist.scatter(
             tensor=qkv_local,
             scatter_list=qkv_chunks,
-            src=0,
+            src=get_tknp_group().first_rank,
             group=self.pg,
         )
         return qkv_local, None
@@ -346,7 +346,7 @@ class TokenParallelRowLinear(RowParallelLinear):
                 input_split_sizes=send_splits,
                 group=self.pg,
             )
-            
+          
             # Perform the row-parallel linear projection
             output = super().forward(gathered_input)
             return output
