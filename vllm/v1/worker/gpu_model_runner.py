@@ -662,7 +662,7 @@ class GPUModelRunner(
         
         work = torch.distributed.broadcast(
             sampled_token_ids_to_broadcast,
-            src=0,  # Root rank
+            src=get_tknp_group().first_rank,  # Root rank
             group=get_tknp_group().device_group,
             async_op=async_op  # Make it asynchronous!
         )
