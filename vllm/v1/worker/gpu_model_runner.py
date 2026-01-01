@@ -2824,10 +2824,14 @@ class GPUModelRunner(
             # Update output token ids with tokens sampled in last step
             # if async scheduling and required by current sampling params.
             self.input_batch.update_async_output_token_ids()
-            return self.sampler(
+            sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            # TKNP
+            if is_tknp_initialized():
+                self._tknp_out_sync(sampler_output, async_op=False)
+            return sampler_output
 
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -2835,10 +2839,6 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
-        
-        # TKNP
-        if is_tknp_initialized():
-            self._tknp_out_sync(sampler_output, async_op=False)
         self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
 
