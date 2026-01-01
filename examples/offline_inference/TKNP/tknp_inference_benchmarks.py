@@ -28,6 +28,8 @@ import torch
 import random
 import numpy as np
 
+from vllm.config import AttentionConfig
+
 def parse_args():
     """Parse command line arguments for distributed vLLM inference."""
     parser = argparse.ArgumentParser(description="Distributed vLLM inference with torchrun")
@@ -148,6 +150,7 @@ def main():
         "seed": args.seed,
         "enforce_eager": True,
         "enable_prefix_caching": False,  # Disable prefix caching for benchmarking
+        "attention_config": AttentionConfig(backend="FLASH_ATTN"),  # Add this line
         "gpu_memory_utilization": 0.9,  # Max GPU memory utilization
         "max_num_batched_tokens": 32768,  # max number of tokens in a single forward pass
     }
