@@ -66,7 +66,8 @@ class TokenParallelQKVLinear(QKVParallelLinear):
         self.tknp_group = get_tknp_group() if self.is_tknp_enabled else None
         self.pg = self.tknp_group.device_group if hasattr(self.tknp_group, 'device_group') else self.tknp_group
         self.device = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else torch.device('cpu')
-
+        self.quant_method = None
+        
         self.params_dtype = kwargs.get('params_dtype', None)
         if self.params_dtype is None:
             # Fallback to torch default or common model dtypes
