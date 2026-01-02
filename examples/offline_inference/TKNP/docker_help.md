@@ -56,21 +56,6 @@ dzdo docker run --gpus all -it --rm \
   --ipc=host --shm-size=20g --ulimit memlock=-1 \
   -p 8001:8001 \
   -v "$HOME:$HOME" \
-  -v "$HOME/Documents/MLSystems/vllm-distributed:/workspace" \
-  -v /mnt/nvme/hf_cache:/mnt/nvme/hf_cache \
-  -w /workspace \
-  -e HF_HOME=/mnt/nvme/hf_cache \
-  --entrypoint bash \
-  susavlsh10/vllm-tknp:v1
-
-```
-
-```bash
-dzdo docker run --gpus all -it --rm \
-  --name vllm-run \
-  --ipc=host --shm-size=20g --ulimit memlock=-1 \
-  -p 8001:8001 \
-  -v "$HOME:$HOME" \
   -v "$HOME/Documents/MLSystems/vllm-tknp:/workspace" \
   -v /mnt/nvme/hf_cache:/mnt/nvme/hf_cache \
   -w /workspace \
@@ -101,5 +86,33 @@ vllm base commit : f1531d9f2a60c347ea1b410bfb04850c92922de0
 export VLLM_COMMIT=5f0af36af555a3813b9d30983bd29c384b84b647 
 export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
 pip install https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
+VLLM_USE_PRECOMPILED=1 pip install --editable .
+```
+
+
+# vllm docker container installation 
+
+```bash
+dzdo docker pull vllm/vllm-openai:latest
+```
+
+```bash
+dzdo docker run --gpus all -it --rm \
+  --name vllm-tests \
+  --ipc=host --shm-size=20g --ulimit memlock=-1 \
+  -p 8002:8002 \
+  -v "$HOME:$HOME" \
+  -v "$HOME/Documents/MLSystems/vllm-tests/vllm-tknp:/workspace" \
+  -v /mnt/nvme/hf_cache:/mnt/nvme/hf_cache \
+  -w /workspace \
+  -e HF_HOME=/mnt/nvme/hf_cache \
+  --entrypoint bash \
+  docker.io/vllm/vllm-openai:latest
+```
+
+```bash
+apt-get update
+apt-get install -y git
+pip install -U numpy
 VLLM_USE_PRECOMPILED=1 pip install --editable .
 ```
