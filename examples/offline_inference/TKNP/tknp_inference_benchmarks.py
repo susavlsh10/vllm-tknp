@@ -24,6 +24,7 @@ import torch.distributed as dist
 from vllm import LLM, SamplingParams
 from prompt_generator import generate_benchmark_prompts
 
+import math
 import torch
 import random
 import numpy as np
@@ -56,8 +57,8 @@ def parse_args():
                         help="Sequence length for prompts (default: 128)")
     parser.add_argument("--print-outputs", action="store_true",
                         help="Print generated outputs")
-    parser.add_argument("--decode-tokens", type=int, default=100,
-                        help="Number of tokens to decode during benchmarking (default: 100)")
+    parser.add_argument("--decode-tokens", type=int, default=128,
+                        help="Number of tokens to decode during benchmarking (default: 128)")
 
     return parser.parse_args()
 
@@ -66,27 +67,60 @@ torch.manual_seed(42)
 random.seed(42)
 np.random.seed(42)
 
-
 def inference_benchmark(llm, prompts, args):
-    # prefill timing
-    prefill_tokens = 1
-    sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=prefill_tokens)
+    """
+    Benchmark prefill and decode phases separately.
     
-    # Create CUDA events for precise GPU timing
+    Strategy:
+    1. Run a generation with max_tokens=1 to measure time until all prompts are prefilled
+       and first decode token is generated
+    2. Run a separate generation with enough tokens to ensure all prompts complete prefill,
+       then measure steady-state decode throughput
+    """
+    
+    # Calculate how many tokens needed to complete all prefills with chunking
+    # With batch_size queries of seq_length tokens and max_num_batched_tokens limit,
+    # we need at least enough decode tokens for all queries to finish their chunked prefill
+    total_prompt_tokens = args.batch_size * args.seq_length
+    max_batched = 32768  # Should match max_num_batched_tokens in LLM config
+    
+    # Number of steps to complete chunked prefill (conservative estimate)
+    # In worst case, we need ceil(total_prompt_tokens / max_batched) steps
+    prefill_steps = math.ceil(total_prompt_tokens / max_batched)
+
+    if dist.get_rank() == 0:
+        print(f"\n{'='*60}")
+        print(f"Benchmark Configuration")
+        print(f"{'='*60}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Sequence length: {args.seq_length}")
+        print(f"Total prompt tokens: {total_prompt_tokens}")
+        print(f"Max batched tokens: {max_batched}")
+        print(f"Estimated prefill steps: {prefill_steps}")
+        print(f"TKNP: {args.token_parallel_size}, TP: {args.tensor_parallel_size}, PP: {args.pipeline_parallel_size}")
+        print(f"{'='*60}\n")
+    
+    # ===== Measurement 1: Prefill + Initial Decode =====
+    # Generate enough tokens to ensure all prefills complete plus a few decode steps
+    prefill_steps += 5 # Add a few extra tokens to ensure steady state
+    sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=prefill_steps)
+    
     prefill_start = torch.cuda.Event(enable_timing=True)
     prefill_end = torch.cuda.Event(enable_timing=True)
     
-    torch.cuda.synchronize()  # Ensure all previous operations complete
+    torch.cuda.synchronize()
     prefill_start.record()
     
     outputs = llm.generate(prompts, sampling_params)
     
     prefill_end.record()
-    torch.cuda.synchronize()  # Wait for completion
+    torch.cuda.synchronize()
     
-    prefill_time_ms = prefill_start.elapsed_time(prefill_end)
+    prefill_warmup_time_ms = prefill_start.elapsed_time(prefill_end)
 
-    # prefill + decode (benchmarking)
+    # ===== Measurement 2: Steady-State Decode =====
+    # Now measure pure decode performance with a longer generation
+    # All prompts are already processed, so this is pure decode
     decode_tokens = args.decode_tokens
     sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=decode_tokens)
     
@@ -102,25 +136,42 @@ def inference_benchmark(llm, prompts, args):
     torch.cuda.synchronize()
     
     total_time_ms = decode_start.elapsed_time(decode_end)
-    decode_only_time_ms = total_time_ms - prefill_time_ms
-    average_decode_latency = decode_only_time_ms / decode_tokens
-    average_decode_system_throughput = (args.batch_size * decode_tokens) / (decode_only_time_ms / 1000)
-    average_decode_throughput_per_user = 1/(average_decode_latency / 1000)
+    
+    # Since we're generating from scratch again, estimate prefill time based on
+    # the first measurement, then subtract to get pure decode time
+    # More accurate: measure the last N tokens where N is large enough to be in steady state
+    
+    tokens_per_query = decode_tokens
+    total_decode_tokens = args.batch_size * tokens_per_query
+    
+    # Estimate prefill completion time (time until all queries enter decode phase)
+    # This is approximately the time for first `prefill_steps` tokens
+    # estimated_prefill_time_ms = (total_time_ms / decode_tokens) * prefill_steps
+    estimated_prefill_time_ms = prefill_warmup_time_ms
+    decode_only_time_ms = total_time_ms - estimated_prefill_time_ms
+    
+    # Calculate metrics
+    average_decode_latency = decode_only_time_ms / (decode_tokens - prefill_steps)
+    average_decode_system_throughput = (args.batch_size * (decode_tokens - prefill_steps)) / (decode_only_time_ms / 1000)
+    average_decode_throughput_per_user = 1 / (average_decode_latency / 1000)
     
     if dist.get_rank() == 0:
         print(f"\n{'='*60}")
-        print(f"Timing Results (Batch size: {args.batch_size}, Seq length: {args.seq_length})")
+        print(f"Timing Results")
         print(f"{'='*60}")
-        print(f"Prefill time: {prefill_time_ms:.2f} ms")
-        print(f"Total time (prefill + {decode_tokens} decode): {total_time_ms:.2f} ms")
-        print(f"Decode only time: {decode_only_time_ms:.2f} ms")
+        print(f"Prefill + warmup time: {prefill_warmup_time_ms:.2f} ms")
+        print(f"Total generation time ({decode_tokens} tokens): {total_time_ms:.2f} ms")
+        print(f"Steady-state decode time: {decode_only_time_ms:.2f} ms")
+        print(f"Steady-state decode tokens: {decode_tokens - prefill_steps}")
+        print(f"\nDecoding Metrics\n")
         print(f"System Decode Throughput: {average_decode_system_throughput:.2f} tokens/sec")
-        print(f"Average decode latency: {average_decode_latency:.2f} ms")
-        print(f"Average decode throughput per user: {average_decode_throughput_per_user:.2f} tokens/sec")
-
+        print(f"Decode Throughput per GPU: {average_decode_system_throughput / dist.get_world_size():.2f} tokens/sec/GPU")
+        print(f"Average Decode Latency: {average_decode_latency:.2f} ms/token/user")
+        print(f"Per-user Decode Throughput: {average_decode_throughput_per_user:.2f} tokens/sec/user")
+        
         print(f"{'='*60}\n")
 
-    # all ranks will have the same outputs
+    # Print outputs if requested
     if dist.get_rank() == 0 and args.print_outputs:
         print("-" * 50)
         for output in outputs:

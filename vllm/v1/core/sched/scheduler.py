@@ -405,8 +405,8 @@ class TokenParallelScheduler:
             used_for_rank += 1
         
         # print debug info
-        if self.rank == 0:
-            self.print_debug_info()
+        # if self.rank == 0:
+        #     self.print_debug_info()
     
     def calculate_tokens_per_rank(self, num_scheduled_tokens: dict[str, int]) -> np.ndarray:
         """
