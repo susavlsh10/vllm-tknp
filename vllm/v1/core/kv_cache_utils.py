@@ -28,6 +28,11 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
+from vllm.distributed.parallel_state import (
+    is_tknp_initialized,
+    get_tknp_rank,
+)
+
 # BlockHash represents the hash of a single KV-cache block used for
 # prefix caching.  Treating it as a distinct type from `bytes` helps
 # catch accidental misuse when passing around raw byte strings.
@@ -1307,12 +1312,21 @@ def _report_kv_cache_config(
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
-    logger.info_once(
-        "Maximum concurrency for %s tokens per request: %.2fx",
-        max_model_len_str,
-        max_concurrency,
-        scope="local",
-    )
+    
+    if not is_tknp_initialized():
+        logger.info_once(
+            "Maximum concurrency for %s tokens per request: %.2fx",
+            max_model_len_str,
+            max_concurrency,
+            scope="local",
+        )
+    else:
+        logger.info(
+            "[RANK %d] Maximum concurrency for %s tokens per request: %.2fx",
+            get_tknp_rank(),
+            max_model_len_str,
+            max_concurrency,
+        )
 
 
 def _max_memory_usage_bytes_from_groups(
