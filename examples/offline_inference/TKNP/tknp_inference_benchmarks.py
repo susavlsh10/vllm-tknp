@@ -28,6 +28,10 @@ import math
 import torch
 import random
 import numpy as np
+import csv
+import os
+from datetime import datetime
+from pathlib import Path
 
 from vllm.config import AttentionConfig
 
@@ -59,9 +63,91 @@ def parse_args():
                         help="Print generated outputs")
     parser.add_argument("--decode-tokens", type=int, default=128,
                         help="Number of tokens to decode during benchmarking (default: 128)")
+    parser.add_argument("--output-dir", type=str, 
+                        default="examples/offline_inference/TKNP/tknp_data",
+                        help="Directory to save benchmark results (default: examples/offline_inference/TKNP/tknp_data)")
+    parser.add_argument("--collect-data", action="store_true",
+                        help="Enable systematic data collection across multiple batch sizes and sequence lengths")
 
     return parser.parse_args()
 
+def get_gpu_name():
+    """Get the GPU name for the current device."""
+    try:
+        gpu_name = torch.cuda.get_device_name(0)
+        # Extract concise GPU name (e.g., "NVIDIA RTX A5000" -> "A5000")
+        # Remove common prefixes and clean up
+        gpu_name = gpu_name.replace("NVIDIA", "").replace("GeForce", "").replace("RTX", "").strip()
+        # Take last significant part (usually the model number)
+        parts = gpu_name.split()
+        gpu_name = parts[-1] if parts else "unknown"
+        return gpu_name
+    except:
+        return "unknown"
+
+def get_model_name(model_path):
+    """Extract concise model name from full model path."""
+    # Extract model name from path like "meta-llama/Llama-3.2-1B-Instruct" -> "Llama-3.2-1B"
+    model_name = model_path.split("/")[-1]  # Get last part after /
+    # Remove common suffixes
+    for suffix in ["-Instruct", "-Chat", "-Base", "-v1", "-v2"]:
+        model_name = model_name.replace(suffix, "")
+    return model_name
+
+def save_benchmark_results(args, metrics, output_dir):
+    """
+    Save benchmark results to CSV file.
+    Only called by rank 0.
+    
+    Args:
+        args: Command line arguments
+        metrics: Dictionary containing benchmark metrics
+        output_dir: Directory to save the CSV file
+    """
+    # Create output directory if it doesn't exist
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Get concise names
+    gpu_name = get_gpu_name()
+    model_name = get_model_name(args.model)
+    
+    # Construct filename
+    tp_size = args.tensor_parallel_size
+    pp_size = args.pipeline_parallel_size
+    tknp_size = args.token_parallel_size if args.enable_token_parallel else 0
+    
+    filename = f"{model_name}_{gpu_name}_TP_{tp_size}_PP_{pp_size}_TKNP_{tknp_size}.csv"
+    filepath = os.path.join(output_dir, filename)
+    
+    # Check if file exists to determine if we need to write headers
+    file_exists = os.path.isfile(filepath)
+    
+    # Prepare data row with concise column names (rounded to 4 decimal places)
+    data_row = {
+        'batch_size': args.batch_size,
+        'seq_length': args.seq_length,
+        'prefill_time': round(metrics['prefill_warmup_time_ms'], 4),
+        'generation_time': round(metrics['total_generation_time_ms'], 4),
+        'decode_time': round(metrics['steady_state_decode_time_ms'], 4),
+        'decode_tokens': metrics['steady_state_decode_tokens'],
+        'sys_decode_tps': round(metrics['system_decode_throughput'], 4),
+        'decode_tps_per_gpu': round(metrics['decode_throughput_per_gpu'], 4),
+        'avg_decode_latency': round(metrics['average_decode_latency'], 4),
+        'decode_tps_per_user': round(metrics['per_user_decode_throughput'], 4),
+    }
+    
+    # Write to CSV (append mode)
+    with open(filepath, 'a', newline='') as csvfile:
+        fieldnames = list(data_row.keys())
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        # Write header if file is new
+        if not file_exists:
+            writer.writeheader()
+        
+        writer.writerow(data_row)
+    
+    print(f"Results saved to: {filepath}")
 
 torch.manual_seed(42)
 random.seed(42)
@@ -171,6 +257,19 @@ def inference_benchmark(llm, prompts, args):
         
         print(f"{'='*60}\n")
 
+        # Save benchmark results
+        metrics = {
+            'prefill_warmup_time_ms': prefill_warmup_time_ms,
+            'total_generation_time_ms': total_time_ms,
+            'steady_state_decode_time_ms': decode_only_time_ms,
+            'steady_state_decode_tokens': decode_tokens - prefill_steps,
+            'system_decode_throughput': average_decode_system_throughput,
+            'decode_throughput_per_gpu': average_decode_system_throughput / dist.get_world_size(),
+            'average_decode_latency': average_decode_latency,
+            'per_user_decode_throughput': average_decode_throughput_per_user,
+        }
+        save_benchmark_results(args, metrics, args.output_dir)
+
     # Print outputs if requested
     if dist.get_rank() == 0 and args.print_outputs:
         print("-" * 50)
@@ -180,9 +279,10 @@ def inference_benchmark(llm, prompts, args):
             print(f"Prompt: {prompt[:128]!r} ....\nGenerated text: {generated_text!r}\n")
             print("-" * 50)
 
-def main():
-    args = parse_args()
 
+def setup_vllm_model(args):
+    """Setup the LLM with given parallelism configurations."""
+    
     # Use `distributed_executor_backend="external_launcher"` so that
     # this llm engine/instance only creates one worker.
     # it is important to set an explicit seed to make sure that
@@ -214,43 +314,111 @@ def main():
         llm_kwargs["token_parallel_size"] = args.token_parallel_size
     
     llm = LLM(**llm_kwargs)
-
     if dist.get_rank() == 0:
-        if args.enable_token_parallel:
-            print(f"LLM initialized with tensor_parallel_size={args.tensor_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size}, data_parallel_size={args.data_parallel_size}, token_parallel_size={args.token_parallel_size}, enable_token_parallel={args.enable_token_parallel}")
-        else:
-            print(f"LLM initialized with tensor_parallel_size={args.tensor_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size}, data_parallel_size={args.data_parallel_size}")
+        print(f"LLM initialized with tensor_parallel_size={args.tensor_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size}, data_parallel_size={args.data_parallel_size}, token_parallel_size={args.token_parallel_size}")
+    return llm  
+
+def run_inference_benchmark(args, llm, batch_size, seq_length):
+    prompts = None
+    if dist.get_rank() == 0:
         
         # Generate benchmark prompts
         prompts = generate_benchmark_prompts(
-        batch_size=args.batch_size,
-        seq_length=args.seq_length,
+        batch_size=batch_size,
+        seq_length=seq_length,
         tokenizer=None,
         model_name=args.model,
         vocab_style="natural",
         seed=42
         )
-    else:
-        prompts = None
     
     # Broadcast prompts to all ranks
     prompts_list = [prompts]
     dist.broadcast_object_list(prompts_list, src=0)
     prompts = prompts_list[0]
     
-    # print(f"Rank {dist.get_rank()} received {len(prompts)} prompts.")
-    # print(f"Rank {dist.get_rank()} prompts: {prompts}")
-    # assert False, "Debugging: Stop execution here to check prompt distribution."
-    
-    # Create sampling parameters, the same across all ranks
-    
     inference_benchmark(llm, prompts, args)
+
+def run_data_collection(args, llm):
+    """
+    Run systematic data collection across multiple batch sizes and sequence lengths.
+    
+    Args:
+        args: Command line arguments
+        llm: Initialized LLM instance
+    """
+    # Define batch sizes and sequence lengths to benchmark
+    batch_sizes = [16, 32, 64, 128]
+    # seq_lengths = [8192, 16384]
+    seq_lengths = [4096]
+    
+    total_runs = len(batch_sizes) * len(seq_lengths)
+    current_run = 0
+    
+    if dist.get_rank() == 0:
+        print("\n" + "="*80)
+        print("STARTING SYSTEMATIC DATA COLLECTION")
+        print("="*80)
+        print(f"Total configurations to test: {total_runs}")
+        print(f"Batch sizes: {batch_sizes}")
+        print(f"Sequence lengths: {seq_lengths}")
+        print(f"Parallelism config: TP={args.tensor_parallel_size}, PP={args.pipeline_parallel_size}, TKNP={args.token_parallel_size if args.enable_token_parallel else 0}")
+        print("="*80 + "\n")
+    
+    # Iterate through all combinations
+    for batch_size in batch_sizes:
+        for seq_length in seq_lengths:
+            current_run += 1
             
+            if dist.get_rank() == 0:
+                print("\n" + "#"*80)
+                print(f"RUN {current_run}/{total_runs}: Batch Size = {batch_size}, Seq Length = {seq_length}")
+                print("#"*80 + "\n")
+            
+            # Update args for this run
+            args.batch_size = batch_size
+            args.seq_length = seq_length
+            
+            try:
+                # Run the benchmark for this configuration
+                run_inference_benchmark(args, llm, batch_size, seq_length)
+                
+                if dist.get_rank() == 0:
+                    print(f"\n✓ Completed run {current_run}/{total_runs}")
+                    
+            except Exception as e:
+                if dist.get_rank() == 0:
+                    print(f"\n✗ Error in run {current_run}/{total_runs}: {str(e)}")
+                    print("Continuing with next configuration...\n")
+                continue
+            
+            # Add a small delay between runs to allow system to stabilize
+            torch.cuda.synchronize()
+            dist.barrier()
+    
+    if dist.get_rank() == 0:
+        print("\n" + "="*80)
+        print("DATA COLLECTION COMPLETE")
+        print("="*80)
+        print(f"Total runs completed: {total_runs}")
+        print(f"Results saved to: {args.output_dir}")
+        print("="*80 + "\n")
+
+def main():
+    args = parse_args()
+
+    llm = setup_vllm_model(args)
+    
+    if args.collect_data:
+        # Run systematic data collection across multiple configurations
+        run_data_collection(args, llm)
+    else:
+        # Run single benchmark with specified batch size and sequence length
+        run_inference_benchmark(args, llm, args.batch_size, args.seq_length)
+    
     # destroy the process group
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
-
-
