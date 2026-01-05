@@ -349,8 +349,7 @@ def run_data_collection(args, llm):
     """
     # Define batch sizes and sequence lengths to benchmark
     batch_sizes = [16, 32, 64, 128]
-    # seq_lengths = [8192, 16384]
-    seq_lengths = [4096]
+    seq_lengths = [4096, 8192, 16384]
     
     total_runs = len(batch_sizes) * len(seq_lengths)
     current_run = 0
