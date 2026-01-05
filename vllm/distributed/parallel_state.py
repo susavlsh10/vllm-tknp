@@ -1159,6 +1159,12 @@ def is_root_rank() -> bool:
         return True
     return get_tknp_rank() == 0
 
+def is_first_tknp_rank() -> bool:
+    """Check if the current rank is the first rank in the token parallel group."""
+    if not is_tknp_initialized():
+        return True
+    return get_tknp_group().is_first_rank
+
 def _print_worker_rank_info(rank: int) -> None:
     """Print rank information for this worker process."""
     import os

@@ -91,11 +91,9 @@ Summary of changes:
 from vllm.model_executor.layers.token_parallel_linear import TokenParallelQKVLinear, TokenParallelRowLinear, init_tknp_layer
 
 from vllm.distributed.parallel_state import (
-    get_tknp_rank, 
-    get_tknp_world_size, 
-    get_tknp_group, 
     is_tknp_initialized,
     is_root_rank,
+    is_first_tknp_rank,
 )
 
 RMSNorm = init_tknp_layer(RMSNorm)
@@ -495,7 +493,7 @@ class LlamaModel(nn.Module):
             return hidden_states, aux_hidden_states
         
         # TKNP
-        if is_tknp_initialized() and get_tknp_rank() != 0:
+        if is_tknp_initialized() and not is_first_tknp_rank():
             # hidden_states needs to be of the shape [batch_size, seq_len, hidden_dim] in all ranks
             hidden_states = torch.zeros(_num_tokens, self.hidden_size, dtype=dtype, device=device)
 
@@ -692,7 +690,7 @@ class LlamaForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         # Early return for non-root ranks in token parallel groups
-        if is_tknp_initialized() and get_tknp_rank() != 0:
+        if is_tknp_initialized() and not is_first_tknp_rank():
             return set()
     
         loader = AutoWeightsLoader(
