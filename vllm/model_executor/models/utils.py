@@ -325,6 +325,13 @@ class AutoWeightsLoader:
         *,
         mapper: WeightsMapper | None = None,
     ) -> set[str]:
+        
+        from vllm.distributed.parallel_state import is_tknp_initialized, is_first_tknp_rank, get_tknp_rank
+        
+        if is_tknp_initialized() and not is_first_tknp_rank():
+            # In token model parallelism, only the first ranks loads weights.
+            return set()
+        
         if mapper is not None:
             weights = mapper.apply(weights)
         # filter out weights with first-prefix/substr to skip in name

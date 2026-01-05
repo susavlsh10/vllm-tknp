@@ -176,6 +176,11 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        
+        # TKNP zero token guard
+        if query.shape[0] == 0:
+            return query, key
+        
         if self.use_flashinfer:
             torch.ops.vllm.flashinfer_rotary_embedding(
                 positions,

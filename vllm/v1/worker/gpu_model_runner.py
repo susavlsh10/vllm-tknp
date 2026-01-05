@@ -3011,13 +3011,16 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
+        outputs = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+        if is_tknp_initialized() and outputs is None:
+            outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
+        return outputs
 
     @staticmethod
     def _is_uniform_decode(
@@ -4543,6 +4546,8 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                if is_tknp_initialized() and outputs is None:
+                    outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
