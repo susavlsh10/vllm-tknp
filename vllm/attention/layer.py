@@ -281,6 +281,10 @@ class Attention(nn.Module, AttentionLayerBase):
         ):
             self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
+        # TKNP zero token guard
+        device = vllm_config.device_config.device if model_config is not None else 'cuda'
+        self.zero_attn_output = torch.empty((0, self.num_heads * self.head_size), dtype=dtype, device=device)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -300,6 +304,11 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
+        
+        # TKNP zero token guard
+        if query.shape[0] == 0:
+            return self.zero_attn_output
+        
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
         output_dtype = query.dtype

@@ -526,6 +526,25 @@ def init_tknp_layer(cls_to_wrap: type) -> type:
                     return input_tensor
             
             return self.module(*args, **kwargs)
+        
+        def tie_weights(self, embed_tokens: nn.Module):
+            """Tie embedding/LM head weights. No-op on non-root TKNP ranks.
+
+            On root, forward to the wrapped module's tie_weights if available,
+            unwrapping embedded wrappers when necessary.
+            """
+            if not self.is_tknp_enabled or self.is_root_rank:
+                target = getattr(self, "module", self)
+                # unwrap embed_tokens if it is also wrapped
+                try:
+                    real_embed = getattr(embed_tokens, "module", embed_tokens)
+                except Exception:
+                    real_embed = embed_tokens
+                if hasattr(target, "tie_weights"):
+                    return target.tie_weights(real_embed)
+                return target
+            # Non-root: do nothing and return self for chaining
+            return self
 
         def __getattr__(self, name):
             # Forward attribute access to the wrapped module
