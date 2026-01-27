@@ -50,6 +50,14 @@ from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
 
+# Token parallel imports
+from vllm.model_executor.layers.token_parallel_linear import TokenParallelQKVLinear, TokenParallelRowLinear, init_tknp_layer
+from vllm.distributed.parallel_state import is_tknp_initialized, is_first_tknp_rank
+
+RMSNorm_TKNP = init_tknp_layer(RMSNorm)
+ParallelLMHead = init_tknp_layer(ParallelLMHead)
+Qwen3MLP = init_tknp_layer(Qwen3MLP)
+
 logger = init_logger(__name__)
 
 
@@ -92,7 +100,7 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.dual_chunk_attention_config = dual_chunk_attention_config
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = TokenParallelQKVLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -101,7 +109,7 @@ class Qwen3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = TokenParallelRowLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -200,8 +208,8 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = RMSNorm_TKNP(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm_TKNP(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -324,6 +332,24 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # For non-root token parallel ranks, only load q_norm and k_norm weights
+        if is_tknp_initialized() and not is_first_tknp_rank():
+            skip_prefixes = ["model.embed_tokens.", "lm_head."]
+            # Load only q_norm and k_norm weights for non-root ranks
+            allowed_patterns = [".self_attn.q_norm.", ".self_attn.k_norm."]
+            
+            filtered_weights = []
+            for name, tensor in weights:
+                # Skip if it starts with any skip prefix
+                if any(name.startswith(prefix) for prefix in skip_prefixes):
+                    continue
+                # Only load if it matches allowed patterns
+                if any(pattern in name for pattern in allowed_patterns):
+                    filtered_weights.append((name, tensor))
+            
+            loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+            return loader.load_weights(filtered_weights)
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),

@@ -76,6 +76,7 @@ from .utils import (
 
 # Token parallel imports
 from vllm.model_executor.layers.token_parallel_linear import TokenParallelQKVLinear, TokenParallelRowLinear, init_tknp_layer
+from vllm.distributed.parallel_state import is_tknp_initialized, is_first_tknp_rank
 
 RMSNorm = init_tknp_layer(RMSNorm)
 VocabParallelEmbedding = init_tknp_layer(VocabParallelEmbedding)
@@ -646,6 +647,11 @@ class LlamaForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        
+        # # In token model parallelism, only the first ranks (root) loads weights.
+        if is_tknp_initialized() and not is_first_tknp_rank():
+            return set()
+        
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
