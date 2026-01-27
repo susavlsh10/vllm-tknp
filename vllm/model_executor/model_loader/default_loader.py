@@ -314,7 +314,13 @@ class DefaultModelLoader(BaseModelLoader):
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
+            
+            from vllm.distributed.parallel_state import is_tknp_initialized, is_first_tknp_rank
             if weights_not_loaded:
+                if is_tknp_initialized() and not is_first_tknp_rank():
+                    # On non-first tknp ranks, weights were not loaded. If weights_not_loaded is not empty, try to load only the missing weights again.
+                    # self.load_missing_weights(model, weights_not_loaded)
+                    return
                 raise ValueError(
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"

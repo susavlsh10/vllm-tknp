@@ -1307,13 +1307,13 @@ def _report_kv_cache_config(
             dcp_size,
         )
     num_tokens_str = f"{num_tokens:,}"
-    logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
     
     if not is_tknp_initialized():
+        logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
         logger.info_once(
             "Maximum concurrency for %s tokens per request: %.2fx",
             max_model_len_str,
@@ -1321,6 +1321,7 @@ def _report_kv_cache_config(
             scope="local",
         )
     else:
+        logger.info("[RANK %d] GPU KV cache size: %s tokens", get_tknp_rank(), num_tokens_str)
         logger.info(
             "[RANK %d] Maximum concurrency for %s tokens per request: %.2fx",
             get_tknp_rank(),

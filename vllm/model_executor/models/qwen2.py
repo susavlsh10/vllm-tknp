@@ -71,7 +71,14 @@ from .utils import (
     maybe_prefix,
 )
 
+from vllm.model_executor.layers.token_parallel_linear import TokenParallelQKVLinear, TokenParallelRowLinear, init_tknp_layer
+from vllm.distributed.parallel_state import is_tknp_initialized, is_first_tknp_rank
 
+RMSNorm_TKNP = init_tknp_layer(RMSNorm)
+VocabParallelEmbedding = init_tknp_layer(VocabParallelEmbedding)
+ParallelLMHead = init_tknp_layer(ParallelLMHead)
+
+@init_tknp_layer
 class Qwen2MLP(nn.Module):
     def __init__(
         self,
@@ -148,7 +155,7 @@ class Qwen2Attention(nn.Module):
         self.dual_chunk_attention_config = dual_chunk_attention_config
         self.qk_norm = qk_norm
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = TokenParallelQKVLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -157,7 +164,7 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = TokenParallelRowLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -276,8 +283,8 @@ class Qwen2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = RMSNorm_TKNP(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm_TKNP(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -406,7 +413,7 @@ class Qwen2Model(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm_TKNP(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -592,7 +599,32 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    # def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    #     loader = AutoWeightsLoader(
+    #         self,
+    #         skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+    #     )
+    #     return loader.load_weights(weights)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # For non-root token parallel ranks, only load q_norm and k_norm weights
+        if is_tknp_initialized() and not is_first_tknp_rank():
+            skip_prefixes = ["model.embed_tokens.", "lm_head."]
+            # Load only q_norm and k_norm weights for non-root ranks
+            allowed_patterns = [".self_attn.q_norm.", ".self_attn.k_norm."]
+            
+            filtered_weights = []
+            for name, tensor in weights:
+                # Skip if it starts with any skip prefix
+                if any(name.startswith(prefix) for prefix in skip_prefixes):
+                    continue
+                # Only load if it matches allowed patterns
+                if any(pattern in name for pattern in allowed_patterns):
+                    filtered_weights.append((name, tensor))
+            
+            loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+            return loader.load_weights(filtered_weights)
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),

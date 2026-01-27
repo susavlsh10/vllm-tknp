@@ -3,13 +3,22 @@ Inference benchmarking script for vLLM with Token Parallelism (TKNP) support.
 
 Example usage:
 Token parallelism: 
-torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --enable-token-parallel --token-parallel-size 2 --batch-size 16 --seq-length 4096
+torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --enable-token-parallel --token-parallel-size 2 --batch-size 16 --seq-length 8192
 
 Tensor parallelism:
-torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 2 --batch-size 16 --seq-length 4096
+torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 2 --batch-size 16 --seq-length 8192
 
 Pipeline parallelism:
-torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --pipeline-parallel-size 2 --batch-size 16 --seq-length 4096
+torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --pipeline-parallel-size 2 --batch-size 16 --seq-length 8192
+
+
+Supported models: 
+
+Llama-3:    meta-llama/Llama-3.2-1B-Instruct, meta-llama/Llama-3.2-3B-Instruct, 
+            meta-llama/Llama-3.1-8B-Instruct, meta-llama/Llama-3.3-70B-Instruct
+Qwen:       Qwen/Qwen2.5-1.5B-Instruct, Qwen/Qwen3-4B-Instruct-2507
+
+Ministral:  ministral/Ministral-3b-instruct
 
 """
 
@@ -50,8 +59,8 @@ def parse_args():
                         help="Enable token parallelism")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct",
                         help="Model name (default: meta-llama/Llama-3.2-1B-Instruct)")
-    parser.add_argument("--max-model-len", type=int, default=32768,
-                        help="Maximum model length (default: 32768)")
+    # parser.add_argument("--max-model-len", type=int, default=131072,
+    #                     help="Maximum model length (default: 131072)")
     parser.add_argument("--seed", type=int, default=1,
                         help="Random seed (default: 1)")
     # batch size and seq length for prompts
@@ -114,7 +123,7 @@ def save_benchmark_results(args, metrics, output_dir):
     # Construct filename
     tp_size = args.tensor_parallel_size
     pp_size = args.pipeline_parallel_size
-    tknp_size = args.token_parallel_size if args.enable_token_parallel else 0
+    tknp_size = args.token_parallel_size
     
     filename = f"{model_name}_{gpu_name}_TP_{tp_size}_PP_{pp_size}_TKNP_{tknp_size}.csv"
     filepath = os.path.join(output_dir, filename)
@@ -297,26 +306,24 @@ def setup_vllm_model(args):
         "pipeline_parallel_size": args.pipeline_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "distributed_executor_backend": "external_launcher",
-        "max_model_len": args.max_model_len,
         "seed": args.seed,
         "enforce_eager": True,
         "enable_prefix_caching": False,  # Disable prefix caching for benchmarking
         "attention_config": AttentionConfig(backend="FLASH_ATTN"),  # Add this line
-        "gpu_memory_utilization": 0.86,  # Max GPU memory utilization
+        "gpu_memory_utilization": 0.8,  # Max GPU memory utilization
         "max_num_batched_tokens": 32768,  # max number of tokens in a single forward pass
+        # "max_model_len": 32768,
     }
     
     # Only add token parallel configs if token parallelism is enabled
-    if args.enable_token_parallel:
-        if args.token_parallel_size <= 1:
-            raise ValueError("Token parallelism requires token_parallel_size > 1")
+    if args.token_parallel_size >= 2:
         llm_kwargs["enable_token_parallel"] = True
         llm_kwargs["token_parallel_size"] = args.token_parallel_size
-    
+
     llm = LLM(**llm_kwargs)
     if dist.get_rank() == 0:
         print(f"LLM initialized with tensor_parallel_size={args.tensor_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size}, data_parallel_size={args.data_parallel_size}, token_parallel_size={args.token_parallel_size}")
-    return llm  
+    return llm
 
 def run_inference_benchmark(args, llm, batch_size, seq_length):
     prompts = None
@@ -348,8 +355,8 @@ def run_data_collection(args, llm):
         llm: Initialized LLM instance
     """
     # Define batch sizes and sequence lengths to benchmark
-    batch_sizes = [16, 32, 64, 128]
-    seq_lengths = [4096, 8192, 16384]
+    batch_sizes = [16, 32, 64]
+    seq_lengths = [8192, 16384, 24576]
     
     total_runs = len(batch_sizes) * len(seq_lengths)
     current_run = 0

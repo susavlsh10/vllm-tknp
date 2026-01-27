@@ -196,6 +196,11 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        
+        # tknp zero guard
+        if x.numel() == 0:
+            return x if residual is None else (x, residual)
+        
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
