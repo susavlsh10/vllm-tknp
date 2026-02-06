@@ -1,2 +1,0 @@
-batch_size,seq_length,prefill_time,generation_time,decode_time,decode_tokens,sys_decode_tps,decode_tps_per_gpu,avg_decode_latency,decode_tps_per_user
-16,4096,870.5201,1578.7522,708.2321,121,2733.5671,683.3918,5.8532,170.8479
