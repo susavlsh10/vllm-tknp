@@ -673,12 +673,153 @@ class GPUModelRunner(
         # # Store the work handle so we can wait later if needed
         return work
 
-    # works better, fixes continuous batching 
-    def _tknp_slicing(self, 
-                      scheduler_output: "SchedulerOutput",
-                      attn_metadata: dict[str, Any],
-                      tknp_metadata: TokenParallelMetadata,
-                      positions: torch.Tensor,):
+    def _slice_tknp_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_tokens_unpadded: int,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+        max_num_scheduled_tokens: int,
+        logits_indices: torch.Tensor,
+    ) -> tuple[
+        int,  # sliced num_tokens
+        int,  # sliced num_reqs
+        np.ndarray,  # sliced num_scheduled_tokens_np
+        int,  # sliced max_num_scheduled_tokens
+        torch.Tensor,  # sliced logits_indices
+        dict[str, int],  # sliced num_scheduled_tokens dict
+        list[int],  # local_req_indices for block table slicing
+    ]:
+        """
+        Slice inputs for token parallel inference before building attention metadata.
+        
+        In token parallel mode, each rank is responsible for a unique set of requests.
+        This method filters the inputs to only include requests assigned to this rank.
+        
+        Args:
+            scheduler_output: The scheduler output with token parallel allocations.
+            num_tokens_unpadded: Total unpadded tokens across all requests.
+            num_reqs: Total number of requests.
+            num_scheduled_tokens_np: Array of scheduled tokens per request.
+            max_num_scheduled_tokens: Maximum scheduled tokens across all requests.
+            logits_indices: Indices for extracting logits.
+            
+        Returns:
+            Tuple of sliced inputs for _build_attention_metadata.
+        """
+        rank = get_tknp_rank()
+        
+        # Get request-to-rank mapping from scheduler output
+        req_to_rank = scheduler_output.token_parallel_allocations.req_to_tknp_rank
+        
+        # Find which request indices belong to this rank
+        req_ids = self.input_batch.req_ids
+        local_req_indices = []
+        for global_idx, req_id in enumerate(req_ids):
+            if req_to_rank.get(req_id, 0) == rank:
+                local_req_indices.append(global_idx)
+        
+        if not local_req_indices:
+            # This rank has no requests - return empty/minimal values
+            empty_logits = torch.zeros(0, dtype=logits_indices.dtype, device=logits_indices.device)
+            return 0, 0, np.array([], dtype=np.int32), 0, empty_logits, {}, []
+        
+        # Slice num_scheduled_tokens array
+        local_num_scheduled_tokens_np = num_scheduled_tokens_np[local_req_indices]
+        local_num_tokens = int(local_num_scheduled_tokens_np.sum())
+        local_num_reqs = len(local_req_indices)
+        local_max_scheduled_tokens = int(local_num_scheduled_tokens_np.max())
+        
+        # Build local num_scheduled_tokens dict
+        local_num_scheduled_tokens_dict = {}
+        for local_idx, global_idx in enumerate(local_req_indices):
+            req_id = req_ids[global_idx]
+            local_num_scheduled_tokens_dict[req_id] = int(local_num_scheduled_tokens_np[local_idx])
+        
+        # Compute token index mapping: which tokens belong to this rank
+        # Calculate cumulative token positions for all requests
+        cu_tokens = np.concatenate(([0], np.cumsum(num_scheduled_tokens_np)))
+        
+        # Find which tokens belong to this rank's requests
+        local_token_mask = np.zeros(cu_tokens[-1], dtype=bool)
+        for global_idx in local_req_indices:
+            start_tok = cu_tokens[global_idx]
+            end_tok = cu_tokens[global_idx + 1]
+            local_token_mask[start_tok:end_tok] = True
+        
+        local_token_indices = np.where(local_token_mask)[0]
+        
+        # Create mapping from global token index to local token index
+        global_to_local_token = {global_idx: local_idx 
+                                  for local_idx, global_idx in enumerate(local_token_indices)}
+        
+        # Compute new logits_indices
+        # Original logits_indices point to positions in the global token array
+        # We need to remap them to the local token array
+        logits_indices_cpu = logits_indices.cpu().numpy()
+        local_logits_list = []
+        for global_idx in local_req_indices:
+            # The logits index for this request is at position global_idx in the original
+            global_logit_idx = logits_indices_cpu[global_idx]
+            if global_logit_idx in global_to_local_token:
+                local_logits_list.append(global_to_local_token[global_logit_idx])
+        
+        local_logits_indices = torch.tensor(
+            local_logits_list, 
+            dtype=logits_indices.dtype, 
+            device=logits_indices.device
+        )
+        
+        # Update query_start_loc for local requests
+        # local_cu_tokens is [0, cumsum[0], cumsum[1], ...] with length local_num_reqs + 1
+        local_cu_tokens = np.cumsum(local_num_scheduled_tokens_np)
+        # query_start_loc[0] = 0, query_start_loc[1:num_reqs+1] = cumsum values
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1:local_num_reqs + 1] = local_cu_tokens
+        # Fill the rest with the last cumsum value for padding
+        self.query_start_loc.np[local_num_reqs + 1:].fill(local_cu_tokens[-1] if len(local_cu_tokens) > 0 else 0)
+        self.query_start_loc.copy_to_gpu()
+        
+        # Update seq_lens for local requests
+        global_seq_lens = self.seq_lens.np[:num_reqs].copy()
+        local_seq_lens = global_seq_lens[local_req_indices]
+        self.seq_lens.np[:local_num_reqs] = local_seq_lens
+        self.seq_lens.np[local_num_reqs:].fill(0)
+        self.seq_lens.copy_to_gpu()
+        
+        # Update slot mapping - slice to only local tokens
+        for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            # Get the current slot mapping and slice it
+            global_slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded].clone()
+            local_slot_mapping = global_slot_mapping[local_token_indices]
+            blk_table.slot_mapping.gpu[:local_num_tokens].copy_(local_slot_mapping)
+            
+            # Slice block table to only local requests
+            # Note: block_table.get_device_tensor will be called later with local_num_reqs
+            # We need to reorder the block table rows
+            global_block_table = blk_table.get_device_tensor(num_reqs).clone()
+            local_block_table = global_block_table[local_req_indices]
+            blk_table.get_device_tensor(local_num_reqs)[:local_num_reqs].copy_(local_block_table)
+        
+        return (
+            local_num_tokens,
+            local_num_reqs,
+            local_num_scheduled_tokens_np,
+            local_max_scheduled_tokens,
+            local_logits_indices,
+            local_num_scheduled_tokens_dict,
+            local_req_indices,
+        )
+    
+    # works better, fixes continuous batching
+    def _tknp_slicing(
+        self,
+        scheduler_output: "SchedulerOutput",
+        attn_metadata: dict[str, Any],
+        tknp_metadata: TokenParallelMetadata,
+        positions: torch.Tensor,
+    ):
         """Slice attention metadata, positions tensor for token parallelism.
         Selects the appropriate slices of attention metadata and positions from the full tensors.
         TODO: This might not be the most efficient approach, revisit after KV cache optimization.
@@ -793,6 +934,36 @@ class GPUModelRunner(
                 processed_metadata_ids.add(metadata_id)
                 
         return attn_metadata, positions
+
+    def _slice_positions_for_tknp(
+        self,
+        positions: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+        local_req_indices: list[int],
+        local_num_scheduled_tokens_np: np.ndarray,
+    ) -> torch.Tensor:
+        """Slice positions tensor for token parallel inference."""
+        req_ids = self.input_batch.req_ids
+        
+        # Get global num_scheduled_tokens for computing indices
+        global_num_scheduled = np.array([
+            scheduler_output.num_scheduled_tokens[req_id] 
+            for req_id in req_ids
+        ], dtype=np.int32)
+        
+        cu_tokens = np.concatenate(([0], np.cumsum(global_num_scheduled)))
+        
+        # Find which tokens belong to this rank's requests
+        local_token_indices = []
+        for global_idx in local_req_indices:
+            start_tok = cu_tokens[global_idx]
+            end_tok = cu_tokens[global_idx + 1]
+            local_token_indices.extend(range(start_tok, end_tok))
+        
+        if self.uses_mrope:
+            return positions[:, local_token_indices].contiguous()
+        else:
+            return positions[local_token_indices].contiguous()
     
     def _tknp_dummy_setup(self, num_tokens: int, num_reqs: int, positions: torch.Tensor): 
         world_size = get_tknp_world_size()
@@ -3338,20 +3509,63 @@ class GPUModelRunner(
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-                (attn_metadata, spec_decode_common_attn_metadata) = (
-                    self._build_attention_metadata(
-                        num_tokens=num_tokens_unpadded,
-                        num_tokens_padded=num_tokens_padded if pad_attn else None,
-                        num_reqs=num_reqs,
-                        num_reqs_padded=num_reqs_padded if pad_attn else None,
-                        max_query_len=max_num_scheduled_tokens,
-                        ubatch_slices=ubatch_slices_attn,
-                        logits_indices=logits_indices,
-                        use_spec_decode=use_spec_decode,
-                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                # TKNP debug
+                # print inputs to build attention metadata
+                if is_tknp_initialized() and get_tknp_world_size() > 1:
+                    (
+                        new_num_tokens_unpadded,
+                        new_num_reqs,
+                        new_num_scheduled_tokens_np,
+                        new_max_num_scheduled_tokens,
+                        new_logits_indices,
+                        local_num_scheduled_tokens_dict,
+                        local_req_indices,
+                    ) = self._slice_tknp_inputs(
+                        scheduler_output,
+                        num_tokens_unpadded,
+                        num_reqs,
+                        num_scheduled_tokens_np,
+                        max_num_scheduled_tokens,
+                        logits_indices,
                     )
-                )
+                    # Update padded values for the local subset
+                    num_tokens_padded = num_tokens_unpadded  # May need padding logic
+                    num_reqs_padded = num_reqs
+
+                    # handle empty batch case 
+                    if new_num_reqs == 0:
+                        attn_metadata = {}
+                        spec_decode_common_attn_metadata = None
+                    else:
+                        (attn_metadata, spec_decode_common_attn_metadata) = (
+                            self._build_attention_metadata(
+                                num_tokens=new_num_tokens_unpadded,
+                                num_tokens_padded=num_tokens_padded if pad_attn else None,
+                                num_reqs=new_num_reqs,
+                                num_reqs_padded=num_reqs_padded if pad_attn else None,
+                                max_query_len=new_max_num_scheduled_tokens,
+                                ubatch_slices=ubatch_slices_attn,
+                                logits_indices=new_logits_indices,
+                                use_spec_decode=use_spec_decode,
+                                num_scheduled_tokens=local_num_scheduled_tokens_dict,
+                                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                            )
+                        )
+                else:
+                    (attn_metadata, spec_decode_common_attn_metadata) = (
+                        self._build_attention_metadata(
+                            num_tokens=num_tokens_unpadded,
+                            num_tokens_padded=num_tokens_padded if pad_attn else None,
+                            num_reqs=num_reqs,
+                            num_reqs_padded=num_reqs_padded if pad_attn else None,
+                            max_query_len=max_num_scheduled_tokens,
+                            ubatch_slices=ubatch_slices_attn,
+                            logits_indices=logits_indices,
+                            use_spec_decode=use_spec_decode,
+                            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        )
+                    )
 
             (
                 input_ids,
@@ -3369,8 +3583,15 @@ class GPUModelRunner(
                     scheduler_output,
                     int(scheduler_output.total_num_scheduled_tokens),
                 )
+                # Slice positions to only local tokens
+                positions = self._slice_positions_for_tknp(
+                    positions, 
+                    scheduler_output, 
+                    local_req_indices,
+                    num_scheduled_tokens_np,
+                )
                 # tknp slicing
-                attn_metadata, positions = self._tknp_slicing(scheduler_output, attn_metadata, tknp_metadata, positions)
+                # attn_metadata, positions = self._tknp_slicing(scheduler_output, attn_metadata, tknp_metadata, positions)
             else:
                 tknp_metadata = None
 
