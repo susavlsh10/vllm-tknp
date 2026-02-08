@@ -3619,6 +3619,7 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            # print(f"[RANK {torch.distributed.get_rank()}] input_ids.shape = {input_ids.shape}, tknp_metadata= {tknp_metadata}")
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

@@ -60,7 +60,7 @@ def generate_benchmark_prompts(
             vocab_style, add_summarization_prompt, seed
         )
         if cached_prompts is not None:
-            print(f"✓ Loaded {len(cached_prompts)} prompts from cache")
+            # print(f"✓ Loaded {len(cached_prompts)} prompts from cache")
             return cached_prompts
     
     # Generate prompts (original logic)
@@ -402,10 +402,10 @@ if __name__ == "__main__":
     )
     elapsed = time.time() - start
     
-    print(f"Loaded {len(prompts_cached)} prompts in {elapsed:.2f}s\n")
+    # print(f"Loaded {len(prompts_cached)} prompts in {elapsed:.2f}s\n")
     
     # Verify they're identical
-    print(f"Prompts identical: {prompts == prompts_cached}\n")
+    # print(f"Prompts identical: {prompts == prompts_cached}\n")
     
     # # List cache files
     # print("="*60)

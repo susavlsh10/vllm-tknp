@@ -3,10 +3,10 @@ Inference benchmarking script for vLLM with Token Parallelism (TKNP) support.
 
 Example usage:
 Token parallelism: 
-torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --enable-token-parallel --token-parallel-size 2 --batch-size 16 --seq-length 8192
+torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --token-parallel-size 2 --batch-size 16 --seq-length 8192
 
 Tensor parallelism:
-torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 2 --batch-size 16 --seq-length 8192
+torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 8 --token-parallel-size 1 --batch-size 32 --seq-length 16384
 
 Pipeline parallelism:
 torchrun --nproc-per-node=2 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --pipeline-parallel-size 2 --batch-size 16 --seq-length 8192
@@ -55,10 +55,8 @@ def parse_args():
                         help="Number of data parallel processes (default: 1)")
     parser.add_argument("--token-parallel-size", type=int, default=1,
                         help="Number of token parallel processes (default: 1)")
-    parser.add_argument("--enable-token-parallel", action="store_true",
-                        help="Enable token parallelism")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct",
-                        help="Model name (default: meta-llama/Llama-3.2-1B-Instruct)")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
+                        help="Model name (default: meta-llama/Llama-3.1-8B-Instruct)")
     # parser.add_argument("--max-model-len", type=int, default=131072,
     #                     help="Maximum model length (default: 131072)")
     parser.add_argument("--seed", type=int, default=1,
@@ -70,13 +68,17 @@ def parse_args():
                         help="Sequence length for prompts (default: 128)")
     parser.add_argument("--print-outputs", action="store_true",
                         help="Print generated outputs")
-    parser.add_argument("--decode-tokens", type=int, default=128,
-                        help="Number of tokens to decode during benchmarking (default: 128)")
+    parser.add_argument("--decode-tokens", type=int, default=1000,
+                        help="Number of tokens to decode during benchmarking (default: 1000)")
     parser.add_argument("--output-dir", type=str, 
                         default="examples/offline_inference/TKNP/tknp_data",
                         help="Directory to save benchmark results (default: examples/offline_inference/TKNP/tknp_data)")
     parser.add_argument("--collect-data", action="store_true",
                         help="Enable systematic data collection across multiple batch sizes and sequence lengths")
+    parser.add_argument("--skip-prefill", action="store_true", default=True,
+                        help="Skip prefill by pre-filling KV cache with dummy values (for decode-only benchmarking)")
+    parser.add_argument("--load-format", type=str, default="dummy",
+                        help="Weight loading format. Use 'dummy' for random weights (default, faster for benchmarking) or 'auto' for real weights")
 
     return parser.parse_args()
 
@@ -84,12 +86,13 @@ def get_gpu_name():
     """Get the GPU name for the current device."""
     try:
         gpu_name = torch.cuda.get_device_name(0)
-        # Extract concise GPU name (e.g., "NVIDIA RTX A5000" -> "A5000")
+        print(f"Detected GPU: {gpu_name}")
+        # Extract concise GPU name (e.g., "NVIDIA H100 80GB HBM3" -> "H100", "NVIDIA RTX A5000" -> "A5000")
         # Remove common prefixes and clean up
         gpu_name = gpu_name.replace("NVIDIA", "").replace("GeForce", "").replace("RTX", "").strip()
-        # Take last significant part (usually the model number)
+        # Take first significant part (the model number like H100, A100, B200, A5000, etc.)
         parts = gpu_name.split()
-        gpu_name = parts[-1] if parts else "unknown"
+        gpu_name = parts[0] if parts else "unknown"
         return gpu_name
     except:
         return "unknown"
@@ -135,13 +138,11 @@ def save_benchmark_results(args, metrics, output_dir):
     data_row = {
         'batch_size': args.batch_size,
         'seq_length': args.seq_length,
-        'prefill_time': round(metrics['prefill_warmup_time_ms'], 4),
-        'generation_time': round(metrics['total_generation_time_ms'], 4),
-        'decode_time': round(metrics['steady_state_decode_time_ms'], 4),
-        'decode_tokens': metrics['steady_state_decode_tokens'],
+        'decode_time_ms': round(metrics['total_decode_time_ms'], 4),
+        'decode_tokens': metrics['total_decode_tokens'],
         'sys_decode_tps': round(metrics['system_decode_throughput'], 4),
         'decode_tps_per_gpu': round(metrics['decode_throughput_per_gpu'], 4),
-        'avg_decode_latency': round(metrics['average_decode_latency'], 4),
+        'avg_decode_latency_ms': round(metrics['average_decode_latency'], 4),
         'decode_tps_per_user': round(metrics['per_user_decode_throughput'], 4),
     }
     
@@ -162,60 +163,92 @@ torch.manual_seed(42)
 random.seed(42)
 np.random.seed(42)
 
+def check_kv_cache_capacity(llm, args):
+    """
+    Check if the current benchmark configuration fits in KV cache.
+    
+    Returns:
+        tuple: (fits: bool, gpu_kv_cache_tokens: int, required_tokens: int, max_concurrency: float)
+    """
+    from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
+    
+    # Access the kv_cache_config through engine_core -> scheduler
+    engine_core = llm.llm_engine.engine_core
+    if hasattr(engine_core, 'engine_core'):
+        # Multiprocess mode
+        engine_core = engine_core.engine_core
+    
+    scheduler = engine_core.scheduler
+    kv_cache_config = scheduler.kv_cache_config
+    vllm_config = llm.llm_engine.vllm_config
+    
+    # Calculate KV cache capacity in tokens
+    min_block_size = min(
+        [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
+    )
+    gpu_kv_cache_tokens = (
+        kv_cache_config.num_blocks
+        // len(kv_cache_config.kv_cache_groups)
+        * min_block_size
+    )
+    
+    # Account for context parallelism if enabled
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    if pcp_size * dcp_size > 1:
+        gpu_kv_cache_tokens *= pcp_size * dcp_size
+    
+    # Calculate maximum concurrency
+    max_concurrency = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    
+    # Calculate required tokens for current benchmark configuration
+    # Each request needs: prompt tokens (seq_length) + decode tokens
+    tokens_per_request = args.seq_length + args.decode_tokens
+    required_tokens = args.batch_size * tokens_per_request
+    
+    # Check if configuration fits
+    fits = required_tokens <= gpu_kv_cache_tokens
+    
+    if dist.get_rank() == 0:
+        print(f"\n{'='*60}")
+        print(f"KV Cache Capacity Check")
+        print(f"{'='*60}")
+        print(f"GPU KV cache size: {gpu_kv_cache_tokens:,} tokens")
+        print(f"Maximum concurrency for {tokens_per_request:,} tokens per request: {max_concurrency:.2f}x")
+        print(f"Total required tokens: {required_tokens:,}")
+        print(f"Capacity utilization: {required_tokens / gpu_kv_cache_tokens * 100:.1f}%")
+        
+        if fits:
+            print(f"✓ Configuration FITS in KV cache - can run concurrently")
+        else:
+            print(f"✗ Configuration EXCEEDS KV cache capacity by {required_tokens - gpu_kv_cache_tokens:,} tokens")
+            print(f"✗ Requests will be QUEUED - benchmark results will not reflect pure concurrent throughput")
+        print(f"{'='*60}\n")
+    
+    return fits, gpu_kv_cache_tokens, required_tokens, max_concurrency
+
 def inference_benchmark(llm, prompts, args):
     """
-    Benchmark prefill and decode phases separately.
+    Benchmark decode performance with skip-prefill enabled.
     
-    Strategy:
-    1. Run a generation with max_tokens=1 to measure time until all prompts are prefilled
-       and first decode token is generated
-    2. Run a separate generation with enough tokens to ensure all prompts complete prefill,
-       then measure steady-state decode throughput
+    Since skip-prefill is enabled, KV cache is pre-filled with dummy values,
+    so we only measure pure decode latency and throughput.
     """
     
-    # Calculate how many tokens needed to complete all prefills with chunking
-    # With batch_size queries of seq_length tokens and max_num_batched_tokens limit,
-    # we need at least enough decode tokens for all queries to finish their chunked prefill
-    total_prompt_tokens = args.batch_size * args.seq_length
-    max_batched = 32768  # Should match max_num_batched_tokens in LLM config
-    
-    # Number of steps to complete chunked prefill (conservative estimate)
-    # In worst case, we need ceil(total_prompt_tokens / max_batched) steps
-    prefill_steps = math.ceil(total_prompt_tokens / max_batched)
-
     if dist.get_rank() == 0:
         print(f"\n{'='*60}")
         print(f"Benchmark Configuration")
         print(f"{'='*60}")
         print(f"Batch size: {args.batch_size}")
         print(f"Sequence length: {args.seq_length}")
-        print(f"Total prompt tokens: {total_prompt_tokens}")
-        print(f"Max batched tokens: {max_batched}")
-        print(f"Estimated prefill steps: {prefill_steps}")
+        print(f"Decode tokens: {args.decode_tokens}")
         print(f"TKNP: {args.token_parallel_size}, TP: {args.tensor_parallel_size}, PP: {args.pipeline_parallel_size}")
+        print(f"Skip-prefill: {args.skip_prefill}")
         print(f"{'='*60}\n")
-    
-    # ===== Measurement 1: Prefill + Initial Decode =====
-    # Generate enough tokens to ensure all prefills complete plus a few decode steps
-    prefill_steps += 5 # Add a few extra tokens to ensure steady state
-    sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=prefill_steps)
-    
-    prefill_start = torch.cuda.Event(enable_timing=True)
-    prefill_end = torch.cuda.Event(enable_timing=True)
-    
-    torch.cuda.synchronize()
-    prefill_start.record()
-    
-    outputs = llm.generate(prompts, sampling_params)
-    
-    prefill_end.record()
-    torch.cuda.synchronize()
-    
-    prefill_warmup_time_ms = prefill_start.elapsed_time(prefill_end)
 
-    # ===== Measurement 2: Steady-State Decode =====
-    # Now measure pure decode performance with a longer generation
-    # All prompts are already processed, so this is pure decode
+    # ===== Decode-Only Measurement =====
     decode_tokens = args.decode_tokens
     sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=decode_tokens)
     
@@ -225,53 +258,36 @@ def inference_benchmark(llm, prompts, args):
     torch.cuda.synchronize()
     decode_start.record()
     
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=(dist.get_rank() == 0))
     
     decode_end.record()
     torch.cuda.synchronize()
     
     total_time_ms = decode_start.elapsed_time(decode_end)
-    
-    # Since we're generating from scratch again, estimate prefill time based on
-    # the first measurement, then subtract to get pure decode time
-    # More accurate: measure the last N tokens where N is large enough to be in steady state
-    
-    tokens_per_query = decode_tokens
-    total_decode_tokens = args.batch_size * tokens_per_query
-    
-    # Estimate prefill completion time (time until all queries enter decode phase)
-    # This is approximately the time for first `prefill_steps` tokens
-    # estimated_prefill_time_ms = (total_time_ms / decode_tokens) * prefill_steps
-    estimated_prefill_time_ms = prefill_warmup_time_ms
-    decode_only_time_ms = total_time_ms - estimated_prefill_time_ms
+    total_decode_tokens = args.batch_size * decode_tokens
     
     # Calculate metrics
-    average_decode_latency = decode_only_time_ms / (decode_tokens - prefill_steps)
-    average_decode_system_throughput = (args.batch_size * (decode_tokens - prefill_steps)) / (decode_only_time_ms / 1000)
-    average_decode_throughput_per_user = 1 / (average_decode_latency / 1000)
+    average_decode_latency = total_time_ms / decode_tokens
+    average_decode_system_throughput = total_decode_tokens / (total_time_ms / 1000)
+    average_decode_throughput_per_user = 1000 / average_decode_latency  # tokens/sec/user
     
     if dist.get_rank() == 0:
         print(f"\n{'='*60}")
-        print(f"Timing Results")
+        print(f"Decode Performance Results")
         print(f"{'='*60}")
-        print(f"Prefill + warmup time: {prefill_warmup_time_ms:.2f} ms")
-        print(f"Total generation time ({decode_tokens} tokens): {total_time_ms:.2f} ms")
-        print(f"Steady-state decode time: {decode_only_time_ms:.2f} ms")
-        print(f"Steady-state decode tokens: {decode_tokens - prefill_steps}")
+        print(f"Total decode time: {total_time_ms:.2f} ms")
+        print(f"Total decode tokens: {total_decode_tokens}")
         print(f"\nDecoding Metrics\n")
         print(f"System Decode Throughput: {average_decode_system_throughput:.2f} tokens/sec")
         print(f"Decode Throughput per GPU: {average_decode_system_throughput / dist.get_world_size():.2f} tokens/sec/GPU")
         print(f"Average Decode Latency: {average_decode_latency:.2f} ms/token/user")
         print(f"Per-user Decode Throughput: {average_decode_throughput_per_user:.2f} tokens/sec/user")
-        
         print(f"{'='*60}\n")
 
         # Save benchmark results
         metrics = {
-            'prefill_warmup_time_ms': prefill_warmup_time_ms,
-            'total_generation_time_ms': total_time_ms,
-            'steady_state_decode_time_ms': decode_only_time_ms,
-            'steady_state_decode_tokens': decode_tokens - prefill_steps,
+            'total_decode_time_ms': total_time_ms,
+            'total_decode_tokens': total_decode_tokens,
             'system_decode_throughput': average_decode_system_throughput,
             'decode_throughput_per_gpu': average_decode_system_throughput / dist.get_world_size(),
             'average_decode_latency': average_decode_latency,
@@ -309,9 +325,10 @@ def setup_vllm_model(args):
         "seed": args.seed,
         "enforce_eager": True,
         "enable_prefix_caching": False,  # Disable prefix caching for benchmarking
-        "attention_config": AttentionConfig(backend="FLASH_ATTN"),  # Add this line
-        "gpu_memory_utilization": 0.8,  # Max GPU memory utilization
+        "gpu_memory_utilization": 0.9,  # Max GPU memory utilization
         "max_num_batched_tokens": 32768,  # max number of tokens in a single forward pass
+        "load_format": args.load_format,  # Weight loading format
+        # "attention_config": AttentionConfig(backend="FLASH_ATTN"), 
         # "max_model_len": 32768,
     }
     
@@ -319,24 +336,47 @@ def setup_vllm_model(args):
     if args.token_parallel_size >= 2:
         llm_kwargs["enable_token_parallel"] = True
         llm_kwargs["token_parallel_size"] = args.token_parallel_size
+    
+    # ADD THIS: Configure DecodeBenchConnector to skip prefill
+    if args.skip_prefill:
+        from vllm.config import KVTransferConfig
+        llm_kwargs["kv_transfer_config"] = KVTransferConfig(
+            kv_connector="DecodeBenchConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "fill_mean": 0.015,  # Mean value for filling KV cache
+                "fill_std": 0.0,     # 0 = constant, >0 = random sampling
+            }
+        )
 
     llm = LLM(**llm_kwargs)
     if dist.get_rank() == 0:
-        print(f"LLM initialized with tensor_parallel_size={args.tensor_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size}, data_parallel_size={args.data_parallel_size}, token_parallel_size={args.token_parallel_size}")
+        print(f"LLM initialized with tensor_parallel_size={args.tensor_parallel_size}, "
+              f"pipeline_parallel_size={args.pipeline_parallel_size}, "
+              f"data_parallel_size={args.data_parallel_size}, "
+              f"token_parallel_size={args.token_parallel_size}")
+        if args.load_format == "dummy":
+            print("⚠️  Using dummy weights (randomly initialized) - suitable for benchmarking only")
+        else:
+            print(f"Loading real model weights with format: {args.load_format}")
+        if args.skip_prefill:
+            print("DecodeBenchConnector enabled - KV cache will be pre-filled with dummy values")
     return llm
 
 def run_inference_benchmark(args, llm, batch_size, seq_length):
+    # Update args for this configuration
+    args.batch_size = batch_size
+    args.seq_length = seq_length
+    
     prompts = None
     if dist.get_rank() == 0:
-        
-        # Generate benchmark prompts
         prompts = generate_benchmark_prompts(
-        batch_size=batch_size,
-        seq_length=seq_length,
-        tokenizer=None,
-        model_name=args.model,
-        vocab_style="natural",
-        seed=42
+            batch_size=batch_size,
+            seq_length=seq_length,
+            tokenizer=None,
+            model_name=args.model,
+            vocab_style="natural",
+            seed=42
         )
     
     # Broadcast prompts to all ranks
@@ -346,20 +386,18 @@ def run_inference_benchmark(args, llm, batch_size, seq_length):
     
     inference_benchmark(llm, prompts, args)
 
+
 def run_data_collection(args, llm):
     """
     Run systematic data collection across multiple batch sizes and sequence lengths.
-    
-    Args:
-        args: Command line arguments
-        llm: Initialized LLM instance
     """
-    # Define batch sizes and sequence lengths to benchmark
     batch_sizes = [16, 32, 64]
     seq_lengths = [8192, 16384, 24576]
     
     total_runs = len(batch_sizes) * len(seq_lengths)
     current_run = 0
+    successful_runs = 0
+    skipped_runs = 0
     
     if dist.get_rank() == 0:
         print("\n" + "="*80)
@@ -368,10 +406,8 @@ def run_data_collection(args, llm):
         print(f"Total configurations to test: {total_runs}")
         print(f"Batch sizes: {batch_sizes}")
         print(f"Sequence lengths: {seq_lengths}")
-        print(f"Parallelism config: TP={args.tensor_parallel_size}, PP={args.pipeline_parallel_size}, TKNP={args.token_parallel_size if args.enable_token_parallel else 0}")
         print("="*80 + "\n")
     
-    # Iterate through all combinations
     for batch_size in batch_sizes:
         for seq_length in seq_lengths:
             current_run += 1
@@ -381,14 +417,23 @@ def run_data_collection(args, llm):
                 print(f"RUN {current_run}/{total_runs}: Batch Size = {batch_size}, Seq Length = {seq_length}")
                 print("#"*80 + "\n")
             
-            # Update args for this run
+            # Update args for capacity check
             args.batch_size = batch_size
             args.seq_length = seq_length
             
+            # Check if configuration fits in KV cache
+            fits, _, _, _ = check_kv_cache_capacity(llm, args)
+            
+            if not fits:
+                skipped_runs += 1
+                if dist.get_rank() == 0:
+                    print(f"⚠️  SKIPPING benchmark - configuration exceeds KV cache capacity")
+                    print(f"\n⊘ Skipped run {current_run}/{total_runs} (exceeds KV cache)\n")
+                continue
+            
             try:
-                # Run the benchmark for this configuration
                 run_inference_benchmark(args, llm, batch_size, seq_length)
-                
+                successful_runs += 1
                 if dist.get_rank() == 0:
                     print(f"\n✓ Completed run {current_run}/{total_runs}")
                     
@@ -398,7 +443,6 @@ def run_data_collection(args, llm):
                     print("Continuing with next configuration...\n")
                 continue
             
-            # Add a small delay between runs to allow system to stabilize
             torch.cuda.synchronize()
             dist.barrier()
     
@@ -406,14 +450,54 @@ def run_data_collection(args, llm):
         print("\n" + "="*80)
         print("DATA COLLECTION COMPLETE")
         print("="*80)
-        print(f"Total runs completed: {total_runs}")
+        print(f"Total configurations: {total_runs}")
+        print(f"Successful runs: {successful_runs}")
+        print(f"Skipped runs: {skipped_runs}")
         print(f"Results saved to: {args.output_dir}")
         print("="*80 + "\n")
+
+
+# warm up the model before benchmarking to ensure accurate measurements
+def warmup_model(llm, args):
+    if dist.get_rank() == 0:
+        print("\nWarming up the model with a few generations...")
+    
+    warmup_prompts = generate_benchmark_prompts(
+        batch_size=args.batch_size,
+        seq_length=128,
+        tokenizer=None,
+        model_name=args.model,
+        vocab_style="natural",
+        seed=42
+    )
+    
+    sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=16)
+    
+    llm.generate(warmup_prompts, sampling_params, use_tqdm=False)
+    
+    torch.cuda.synchronize()
+    dist.barrier()
+    
+    if dist.get_rank() == 0:
+        print("Model warmup complete.\n")
 
 def main():
     args = parse_args()
 
     llm = setup_vllm_model(args)
+
+    # Check KV cache capacity before warmup
+    fits, _, _, _ = check_kv_cache_capacity(llm, args)
+    if not fits and not args.collect_data:
+        if dist.get_rank() == 0:
+            print("⚠️  ABORTING: Benchmark configuration exceeds KV cache capacity")
+            print("   Results would reflect queued behavior, not concurrent throughput")
+            print("   Please reduce batch_size or seq_length and try again")
+        dist.destroy_process_group()
+        return
+
+    # Warm up the model before benchmarking
+    warmup_model(llm, args)
     
     if args.collect_data:
         # Run systematic data collection across multiple configurations
