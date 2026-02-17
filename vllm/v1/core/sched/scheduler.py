@@ -79,6 +79,7 @@ class TokenParallelScheduler:
         self.parallel_config = vllm_config.parallel_config
         self.tknp_world_size = get_tknp_world_size()
         self.rank = get_tknp_rank()
+        self.world_rank = torch.distributed.get_rank()
 
         # Kept for compatibility (not used for scheduling anymore)
         self.next_tknp_rank_assignment = 0  
@@ -107,14 +108,43 @@ class TokenParallelScheduler:
     # ----------------------------------------------------------------------
     def assign_ranks(self, waiting_requests, free_blocks_per_rank=None):
         """
-        Assign token parallel ranks to new requests using block-wise assignment.
+        Assign token parallel ranks to new requests using capacity-aware,
+        attention-cost-balanced, block-wise assignment.
+
+        Design goals (assuming approximately equal sequence lengths):
+        
+        1. **Root rank (rank 0) has lowest KV capacity** because it also
+           stores model weights.  We must respect its memory limit but still
+           assign it as many requests as it can handle to keep total
+           attention cost low.
+        2. **Non-root ranks should be balanced** so they finish attention
+           at roughly the same time.  With equal sequence lengths, this
+           means equal request counts across non-root ranks.
+        3. **Root should never be the bottleneck**: root gets at most as
+           many requests as the non-root ranks, and strictly fewer when
+           its KV capacity is the limiting factor.
+        4. **Small workloads**: if all requests fit on root alone,
+           distribute evenly across the full TKNP group.
+        5. **Block-wise contiguous assignment** is preserved (no
+           rearranging): rank 0 gets the first N₀ requests, rank 1 the
+           next N₁, etc.
+
+        Algorithm
+        ---------
+        a) Estimate blocks each new request will consume.
+        b) Compute how many requests each rank can maximally hold.
+        c) If workload is small (fits on root) → even split across all ranks.
+        d) Otherwise, balance non-root ranks evenly first, then give root
+           the minimum of (its capacity, non-root count) so it is never
+           the slowest rank.  Redistribute any surplus from root to
+           non-root ranks to keep them balanced.
 
         Args:
             waiting_requests: The waiting queue containing new requests
                               (iterable; order is respected).
             free_blocks_per_rank: Optional array-like of length tknp_world_size.
                 Each entry is the number of free KV blocks on that rank.
-                If None or invalid, we fall back to equal blocks.
+                If None or invalid, we fall back to equal distribution.
         """
         # Turn waiting queue into a list to allow indexed access
         waiting_list = list(waiting_requests)
@@ -130,82 +160,368 @@ class TokenParallelScheduler:
             return  # nothing to do
 
         # ------------------------------------------------------------------
-        # 1) Decide target number of NEW requests per rank based on free blocks.
+        # 0) Estimate the average KV blocks each request will need.
+        #    Since all requests have ~equal sequence length we can use the
+        #    mean prompt length as the representative cost.
+        # ------------------------------------------------------------------
+        total_prompt_tokens = 0
+        for idx in unassigned_indices:
+            req = waiting_list[idx]
+            prompt_len = (len(req.prompt_token_ids)
+                          if req.prompt_token_ids is not None
+                          else req.num_prompt_tokens)
+            total_prompt_tokens += prompt_len
+
+        avg_prompt_len = total_prompt_tokens / num_unassigned
+        blocks_per_req = max(1, math.ceil(avg_prompt_len / self.block_size))
+
+        # ------------------------------------------------------------------
+        # 1) Determine per-rank capacity (max requests that fit).
         # ------------------------------------------------------------------
         use_capacity_aware = (
             free_blocks_per_rank is not None
             and len(free_blocks_per_rank) == self.tknp_world_size
         )
 
-        # print("Free blocks per rank:", free_blocks_per_rank)
         if use_capacity_aware:
-            free = np.asarray(free_blocks_per_rank, dtype=np.float64)
-            total_free = float(free.sum())
-
-            if total_free <= 0.0:
-                # Every rank reports 0 free blocks → fallback to equal distribution.
+            free = np.asarray(free_blocks_per_rank, dtype=np.int64)
+            if free.sum() <= 0:
                 use_capacity_aware = False
-            else:
-                # Ideal (non-integer) allocation of new requests per rank
-                ideal = free * (num_unassigned / total_free)
-                base = np.floor(ideal).astype(np.int32)
-                assigned_counts = base.copy()
 
-                # Distribute leftover (due to rounding) to ranks
-                # with the largest fractional part of `ideal`.
-                remaining = num_unassigned - int(base.sum())
-                if remaining > 0:
-                    frac = ideal - base
-                    order = np.argsort(-frac)  # descending fractional parts
-                    for r in order[:remaining]:
-                        assigned_counts[r] += 1
+        if use_capacity_aware:
+            # Maximum number of new requests each rank can accommodate.
+            capacity_per_rank = np.array(
+                [int(f // blocks_per_req) for f in free],
+                dtype=np.int32,
+            )
+            total_capacity = int(capacity_per_rank.sum())
+
+            # Can every request fit on root alone?
+            root_capacity = int(capacity_per_rank[0])
+            all_fit_on_root = (root_capacity >= num_unassigned)
+
+            # ------------------------------------------------------------------
+            # 2) Decide assigned_counts per rank.
+            # ------------------------------------------------------------------
+            if all_fit_on_root:
+                # Case A: workload is small — distribute evenly across all ranks.
+                base = num_unassigned // self.tknp_world_size
+                remainder = num_unassigned % self.tknp_world_size
+                assigned_counts = np.full(self.tknp_world_size, base,
+                                          dtype=np.int32)
+                # Give the extra requests to non-root ranks first (save root
+                # memory), then root if needed.
+                for r in range(remainder):
+                    # Prefer non-root ranks: indices 1, 2, ..., then 0
+                    target = (r + 1) % self.tknp_world_size
+                    assigned_counts[target] += 1
+            else:
+                # Case B: root cannot hold everything.
+                # Strategy: balance non-root ranks first, then give root
+                # at most as many as a non-root rank (capped by its capacity).
+                # This ensures root is NEVER the attention bottleneck.
+
+                num_non_root = self.tknp_world_size - 1
+
+                if num_non_root > 0:
+                    # First, figure out the non-root per-rank count if root
+                    # gets 0 — this is the upper bound for non-root.
+                    non_root_capacities = capacity_per_rank[1:]
+
+                    # Ideal: distribute all requests evenly across non-root
+                    # ranks, then give root ≤ that count.
+                    # Start by computing how many non-root can handle if
+                    # each gets an equal share.
+                    non_root_equal = num_unassigned // self.tknp_world_size
+                    # Root should get at most non_root_equal, capped by its
+                    # memory capacity.
+                    root_count = min(root_capacity, non_root_equal)
+
+                    # Remaining requests go to non-root ranks, balanced.
+                    remaining = num_unassigned - root_count
+
+                    # Distribute remaining evenly across non-root ranks.
+                    non_root_base = remaining // num_non_root
+                    non_root_remainder = remaining % num_non_root
+
+                    assigned_counts = np.zeros(self.tknp_world_size,
+                                               dtype=np.int32)
+                    assigned_counts[0] = root_count
+
+                    for r in range(1, self.tknp_world_size):
+                        count = non_root_base
+                        if r - 1 < non_root_remainder:
+                            count += 1
+                        # Clamp to what this rank can actually hold.
+                        count = min(count, int(capacity_per_rank[r]))
+                        assigned_counts[r] = count
+
+                    # Check: if total assigned < num_unassigned (due to
+                    # clamping), push overflow to ranks with remaining
+                    # capacity (non-root first, then root).
+                    assigned_so_far = int(assigned_counts.sum())
+                    shortfall = num_unassigned - assigned_so_far
+                    if shortfall > 0:
+                        # Try non-root ranks first.
+                        for r in range(1, self.tknp_world_size):
+                            room = int(capacity_per_rank[r]) - assigned_counts[r]
+                            give = min(room, shortfall)
+                            assigned_counts[r] += give
+                            shortfall -= give
+                            if shortfall <= 0:
+                                break
+                    if shortfall > 0:
+                        # Last resort: root absorbs more.
+                        assigned_counts[0] += shortfall
+                else:
+                    # Only root rank exists (world_size == 1).
+                    assigned_counts = np.array([num_unassigned],
+                                               dtype=np.int32)
+
         # ------------------------------------------------------------------
-        # 2) Fallback: equal (old-style) block assignment.
+        # Fallback: no capacity info — equal distribution.
         # ------------------------------------------------------------------
         if not use_capacity_aware:
-            assigned_counts = np.zeros(self.tknp_world_size, dtype=np.int32)
-            # Simple equal blocks over *unassigned* requests
-            block_size = max(
-                1, math.ceil(num_unassigned / self.tknp_world_size)
-            )
-            for r in range(self.tknp_world_size):
-                remaining = num_unassigned - int(assigned_counts.sum())
-                if remaining <= 0:
-                    break
-                assigned_counts[r] = min(block_size, remaining)
+            base = num_unassigned // self.tknp_world_size
+            remainder = num_unassigned % self.tknp_world_size
+            assigned_counts = np.full(self.tknp_world_size, base,
+                                      dtype=np.int32)
+            for r in range(remainder):
+                target = (r + 1) % self.tknp_world_size
+                assigned_counts[target] += 1
 
-        # Sanity: sum of target counts must match number of unassigned
+        # Sanity: sum of target counts must match number of unassigned.
         assert int(assigned_counts.sum()) == num_unassigned, \
             f"assigned_counts sum={assigned_counts.sum()} != num_unassigned={num_unassigned}"
 
         # ------------------------------------------------------------------
         # 3) Block-wise assignment in waiting order.
-        #    Example: assigned_counts = [4, 6] →
-        #      - first 4 unassigned → rank 0
-        #      - next 6 unassigned → rank 1
+        #    Example: assigned_counts = [13, 17, 17, 17] →
+        #      - first 13 unassigned → rank 0 (root)
+        #      - next  17 unassigned → rank 1
+        #      - next  17 unassigned → rank 2
+        #      - next  17 unassigned → rank 3
         # ------------------------------------------------------------------
         current_rank = 0
         used_for_rank = 0
-        # print("Assigned counts per rank:", assigned_counts)
 
         for idx in unassigned_indices:
             # Advance to next rank if current rank's quota is filled
-            while current_rank < self.tknp_world_size and \
-                  used_for_rank >= assigned_counts[current_rank]:
+            while (current_rank < self.tknp_world_size
+                   and used_for_rank >= assigned_counts[current_rank]):
                 current_rank += 1
                 used_for_rank = 0
 
             if current_rank >= self.tknp_world_size:
-                # Should not happen because of the sum check above,
-                # but be defensive.
+                # Defensive fallback — should not happen.
                 current_rank = self.tknp_world_size - 1
 
             req = waiting_list[idx]
             self._assign_request_to_rank(req, current_rank)
             used_for_rank += 1
-        
+
         # print debug info
-        if self.rank == 0:
+        if self.world_rank == 0:
+            self.print_debug_info()
+
+    def assign_ranks(self, waiting_requests, free_blocks_per_rank=None):
+        """
+        Assign token parallel ranks to new requests using capacity-aware,
+        attention-cost-balanced, block-wise assignment.
+
+        Design goals (assuming approximately equal sequence lengths):
+
+        1. **Root rank (rank 0) has lowest KV capacity** because it also
+           stores model weights.  We must respect its memory limit but still
+           assign it as many requests as it can handle to keep total
+           attention cost low.
+        2. **Non-root ranks should be balanced** so they finish attention
+           at roughly the same time.  With equal sequence lengths, this
+           means equal request counts across non-root ranks.
+        3. **Root should never be the bottleneck**: root gets at most as
+           many requests as the non-root ranks, and strictly fewer when
+           its KV capacity is the limiting factor.  Root must NEVER be
+           assigned more requests than it can hold in KV cache.
+        4. **Small workloads**: if all requests fit on root alone,
+           distribute evenly across the full TKNP group — but still
+           respect root's capacity hard-cap.
+        5. **Block-wise contiguous assignment** is preserved (no
+           rearranging): rank 0 gets the first N₀ requests, rank 1 the
+           next N₁, etc.
+
+        Algorithm
+        ---------
+        a) Estimate the *full lifetime* KV blocks each request will consume
+           (prompt + max_tokens), not just the prompt.
+        b) Compute how many requests each rank can maximally hold.
+        c) Compute a balanced target where root ≤ non-root, and root is
+           hard-capped at its capacity.
+        d) Redistribute any surplus evenly across non-root ranks.
+
+        Args:
+            waiting_requests: The waiting queue containing new requests
+                              (iterable; order is respected).
+            free_blocks_per_rank: Optional array-like of length tknp_world_size.
+                Each entry is the number of free KV blocks on that rank.
+                If None or invalid, we fall back to equal distribution.
+        """
+        # Turn waiting queue into a list to allow indexed access
+        waiting_list = list(waiting_requests)
+
+        # Indices of requests that don't yet have an assignment
+        unassigned_indices: list[int] = []
+        for idx, req in enumerate(waiting_list):
+            if req.request_id not in self.req_to_tknp_rank:
+                unassigned_indices.append(idx)
+
+        num_unassigned = len(unassigned_indices)
+        if num_unassigned == 0:
+            return  # nothing to do
+
+        # ------------------------------------------------------------------
+        # 0) Estimate the *full lifetime* KV blocks each request will need.
+        #    This includes both prompt tokens AND the maximum output tokens
+        #    the request may generate.  Using only prompt length would
+        #    drastically underestimate memory usage and cause OOM on root.
+        # ------------------------------------------------------------------
+        total_lifetime_tokens = 0
+        for idx in unassigned_indices:
+            req = waiting_list[idx]
+            prompt_len = (len(req.prompt_token_ids)
+                          if req.prompt_token_ids is not None
+                          else req.num_prompt_tokens)
+            max_output = getattr(req, 'max_tokens', 0) or 0
+            total_lifetime_tokens += (prompt_len + max_output)
+
+        avg_lifetime_tokens = total_lifetime_tokens / num_unassigned
+        blocks_per_req = max(1, math.ceil(avg_lifetime_tokens / self.block_size))
+
+        # ------------------------------------------------------------------
+        # 1) Determine per-rank capacity (max requests that fit).
+        # ------------------------------------------------------------------
+        use_capacity_aware = (
+            free_blocks_per_rank is not None
+            and len(free_blocks_per_rank) == self.tknp_world_size
+        )
+
+        if use_capacity_aware:
+            free = np.asarray(free_blocks_per_rank, dtype=np.int64)
+            if free.sum() <= 0:
+                use_capacity_aware = False
+
+        if use_capacity_aware:
+            # Maximum number of new requests each rank can accommodate
+            # over their full lifetime.
+            capacity_per_rank = np.array(
+                [int(f // blocks_per_req) for f in free],
+                dtype=np.int32,
+            )
+
+            root_capacity = int(capacity_per_rank[0])
+            num_non_root = self.tknp_world_size - 1
+
+            # ------------------------------------------------------------------
+            # 2) Compute balanced assignment with root hard-capped.
+            #
+            #    Target: all ranks get the same count (ideal even split),
+            #    but root is hard-capped at root_capacity.  Any requests
+            #    that root cannot take are redistributed evenly across
+            #    non-root ranks.
+            # ------------------------------------------------------------------
+            even_share = num_unassigned // self.tknp_world_size
+            even_remainder = num_unassigned % self.tknp_world_size
+
+            # Root gets at most even_share, and never more than its capacity.
+            root_count = min(even_share, root_capacity)
+            # print(f"Root count: {root_count}, Root capacity: {root_capacity}")
+
+            if num_non_root > 0:
+                # Requests that need to go to non-root ranks.
+                remaining = num_unassigned - root_count
+
+                non_root_base = remaining // num_non_root
+                non_root_remainder = remaining % num_non_root
+
+                assigned_counts = np.zeros(self.tknp_world_size,
+                                           dtype=np.int32)
+                assigned_counts[0] = root_count
+
+                for r in range(1, self.tknp_world_size):
+                    count = non_root_base
+                    if r - 1 < non_root_remainder:
+                        count += 1
+                    # Hard-cap to what this rank can actually hold.
+                    count = min(count, int(capacity_per_rank[r]))
+                    assigned_counts[r] = count
+
+                # If clamping reduced the total, push overflow to ranks
+                # with remaining capacity (non-root first, then root).
+                assigned_so_far = int(assigned_counts.sum())
+                shortfall = num_unassigned - assigned_so_far
+                if shortfall > 0:
+                    for r in range(1, self.tknp_world_size):
+                        room = int(capacity_per_rank[r]) - assigned_counts[r]
+                        give = min(room, shortfall)
+                        assigned_counts[r] += give
+                        shortfall -= give
+                        if shortfall <= 0:
+                            break
+                if shortfall > 0:
+                    # Last resort: root absorbs more (may OOM but nothing
+                    # else can be done — total system capacity is exceeded).
+                    assigned_counts[0] += shortfall
+                    # print(f"Warning: total capacity exceeded by {shortfall} requests; assigned more to root rank.")
+
+                    # throw an error that we can catch upstream to mark these requests as failed due to capacity issues
+                    raise RuntimeError(
+                        f"Unable to schedule {shortfall} requests due to insufficient "
+                        f"capacity across all ranks. Assigned: {assigned_counts.tolist()}, "
+                        f"Capacity: {capacity_per_rank.tolist()}"
+                    )
+            else:
+                # Only root rank exists (world_size == 1).
+                assigned_counts = np.array([num_unassigned], dtype=np.int32)
+
+        # print(f"[Rank {self.rank}] Assigned counts before fallback: {assigned_counts}, Capacity per rank: {capacity_per_rank if use_capacity_aware else 'N/A'}")
+        # ------------------------------------------------------------------
+        # Fallback: no capacity info — equal distribution.
+        # ------------------------------------------------------------------
+        if not use_capacity_aware:
+            base = num_unassigned // self.tknp_world_size
+            remainder = num_unassigned % self.tknp_world_size
+            assigned_counts = np.full(self.tknp_world_size, base,
+                                      dtype=np.int32)
+            for r in range(remainder):
+                target = (r + 1) % self.tknp_world_size
+                assigned_counts[target] += 1
+
+        # Sanity: sum of target counts must match number of unassigned.
+        assert int(assigned_counts.sum()) == num_unassigned, \
+            f"assigned_counts sum={assigned_counts.sum()} != num_unassigned={num_unassigned}"
+
+        # ------------------------------------------------------------------
+        # 3) Block-wise assignment in waiting order.
+        # ------------------------------------------------------------------
+        current_rank = 0
+        used_for_rank = 0
+
+        for idx in unassigned_indices:
+            # Advance to next rank if current rank's quota is filled
+            while (current_rank < self.tknp_world_size
+                   and used_for_rank >= assigned_counts[current_rank]):
+                current_rank += 1
+                used_for_rank = 0
+
+            if current_rank >= self.tknp_world_size:
+                # Defensive fallback — should not happen.
+                current_rank = self.tknp_world_size - 1
+
+            req = waiting_list[idx]
+            self._assign_request_to_rank(req, current_rank)
+            used_for_rank += 1
+
+        # print debug info
+        if self.world_rank == 0:
             self.print_debug_info()
             
     def calculate_tokens_per_rank(self, num_scheduled_tokens: dict[str, int]) -> np.ndarray:
@@ -242,9 +558,9 @@ class TokenParallelScheduler:
             )
 
     def print_debug_info(self):
-        # logger.info(
-        #     f"[TokenParallelScheduler] Token parallel rank assignments: {self.req_to_tknp_rank}"
-        # )
+        logger.info(
+            f"[TokenParallelScheduler] Token parallel rank assignments: {self.req_to_tknp_rank}"
+        )
         logger.info(
             f"[TokenParallelScheduler] Requests per rank: {self.tknp_reqs_per_rank}"
         )
@@ -743,15 +1059,6 @@ class Scheduler(SchedulerInterface):
                     self.waiting,
                     free_blocks_per_rank=free_blocks_per_rank,
                 )
-
-                # TODO: the root rank should assign the ranks for consistency
-                # if is_root_rank():
-                #     self.token_parallel_scheduler.assign_ranks(
-                #         self.waiting,
-                #         free_blocks_per_rank=free_blocks_per_rank,
-                #     )
-                # Broadcast the assignment map to all TKNP ranks
-                # self._sync_tknp_assignments()
 
             while self.waiting and token_budget > 0:
                 
@@ -1265,37 +1572,14 @@ class Scheduler(SchedulerInterface):
                 break
 
             if self.is_encoder_decoder and num_computed_tokens > 0:
-                assert start_pos == 0, (
-                    "Encoder input should be processed at the beginning of "
-                    "the sequence when encoder-decoder models are used."
-                )
-                # Encoder input has already been computed
-                # The calculation here is a bit different. We don't turn encoder
-                # output into tokens that get processed by the decoder and
-                # reflected in num_computed_tokens. Instead, start_pos reflects
-                # the position where we need to ensure we calculate encoder
-                # inputs. This should always be 0 to ensure we calculate encoder
-                # inputs before running the decoder.  Once we've calculated some
-                # decoder tokens (num_computed_tokens > 0), then we know we
-                # already calculated encoder inputs and can skip here.
-                continue
-            elif start_pos + num_encoder_tokens <= num_computed_tokens:
+                # With Whisper, as soon as we've generated a single token,
+                # we know we're done with the encoder input. Cross Attention
+                # KVs have been calculated and cached already.
+                self.encoder_cache_manager.free_encoder_input(request, input_id)
+            elif start_pos + num_encoder_tokens <= request.num_computed_tokens:
                 # The encoder input is already computed and stored
                 # in the decoder's KV cache.
-                continue
-
-            if not self.is_encoder_decoder:
-                # We are not using the encoder cache for encoder-decoder models,
-                # yet.
-                if request.mm_features[i].identifier in mm_hashes_to_schedule:
-                    # The same encoder input has already been scheduled in the
-                    # current step.
-                    continue
-
-                if self.encoder_cache_manager.check_and_update_cache(request, i):
-                    # The encoder input is already computed and cached from a
-                    # previous step.
-                    continue
+                self.encoder_cache_manager.free_encoder_input(request, input_id)
 
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
