@@ -234,4 +234,5 @@ examples/offline_inference/TKNP/tknp_data/*
 examples/offline_inference/TKNP/graphs/*
 examples/offline_inference/TKNP/paper.md
 examples/offline_inference/TKNP/llama_diff.diff
+examples/offline_inference/TKNP/jobs/*.sh
 logs/*
