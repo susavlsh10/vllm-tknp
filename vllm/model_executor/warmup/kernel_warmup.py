@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
 
+from vllm.distributed.parallel_state import is_tknp_initialized
+
 logger = init_logger(__name__)
 
 
@@ -64,13 +66,16 @@ def kernel_warmup(worker: "Worker"):
         logger.info("Warming up FlashInfer attention.")
         # Warmup with mixed batch containing both prefill and decode tokens
         # This is to warm up both prefill and decode attention kernels
-        worker.model_runner._dummy_run(
-            num_tokens=16,
-            skip_eplb=True,
-            is_profile=True,
-            force_attention=True,
-            create_mixed_batch=True,
-        )
+        if not is_tknp_initialized():
+            worker.model_runner._dummy_run(
+                num_tokens=16,
+                skip_eplb=True,
+                is_profile=True,
+                force_attention=True,
+                create_mixed_batch=True,
+            )
+        else:
+            logger.info("Skipping FlashInfer attention warmup since TKNP is initialized.")
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:

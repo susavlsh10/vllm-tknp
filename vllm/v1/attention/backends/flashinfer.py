@@ -1596,6 +1596,7 @@ def fast_plan_decode(
             logits_soft_cap,
             q_data_type,
             kv_data_type,
+            None,# o_data_type
             data_type,
             sm_scale,
             rope_scale,

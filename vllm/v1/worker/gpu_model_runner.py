@@ -4723,6 +4723,7 @@ class GPUModelRunner(
                 
             if is_tknp_initialized():
                 tknp_metadata, positions = self._tknp_dummy_setup(num_tokens, num_reqs, positions)
+                # logger.info(f"[RANK {get_tknp_rank()}] tknp_metadata: {tknp_metadata}, positions: {positions}")
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
