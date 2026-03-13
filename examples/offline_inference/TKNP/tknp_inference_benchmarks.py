@@ -3,10 +3,10 @@ Inference benchmarking script for vLLM with Token Parallelism (TKNP) support.
 
 Example usage:
 Token parallelism: 
-torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 4 --token-parallel-size 2 --batch-size 32 --seq-length 32768
+torchrun --nproc-per-node=4 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --token-parallel-size 4 --batch-size 32 --seq-length 32768
 
 Tensor parallelism:
-torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 8 --token-parallel-size 1 --batch-size 32 --seq-length 16384
+torchrun --nproc-per-node=4 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 4 --token-parallel-size 1 --batch-size 32 --seq-length 16384
 
 Pipeline parallelism:
 torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 4 --pipeline-parallel-size 2 --batch-size 32 --seq-length 32768
@@ -637,10 +637,19 @@ def run_data_collection(args, llm):
         # 128: [16384, 32768]
 
         # Llama 3.3-70B configs for 8 Nodes (64 GPUs) with TP 8 + TKNP/PP 8
+        # 32: [32768, 65536, 98304, 114688],
+        # 64: [32768, 65536, 98304], #, 49152]
+        # 128: [16384, 32768, 65536],
+        # 256: [16384, 32768],
+
+        # B200 configs for Llama 8b
         32: [32768, 65536, 98304, 114688],
-        64: [32768, 65536, 98304], #, 49152]
+        64: [32768, 65536, 98304],
         128: [16384, 32768, 65536],
-        256: [16384, 32768],
+        256: [16384, 32768, 65536],
+
+        # B200 configs for Llama 3.3-70B
+        # 32: [32768, 65536, 98304, 114688]
     }
     
     total_runs = sum(len(seq_lengths) for seq_lengths in batch_seq_configs.values())
