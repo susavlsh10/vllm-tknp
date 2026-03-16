@@ -3189,8 +3189,15 @@ class GPUModelRunner(
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+        # if is_tknp_initialized() and outputs is None:
+        #     outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
+
         if is_tknp_initialized() and outputs is None:
-            outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
+            # outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
+            _ref = input_ids if input_ids is not None else inputs_embeds
+            outputs = torch.zeros(_ref.size(0), self.model_config.get_hidden_size(),
+                                dtype=self.model_config.dtype, device=_ref.device)
+
         return outputs
 
     @staticmethod
@@ -4770,8 +4777,11 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
                 if is_tknp_initialized() and outputs is None:
-                    outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
-
+                    # outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
+                    _ref = input_ids if input_ids is not None else inputs_embeds
+                    outputs = torch.zeros(_ref.size(0), self.model_config.get_hidden_size(),
+                                        dtype=self.model_config.dtype, device=_ref.device)
+                    
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:

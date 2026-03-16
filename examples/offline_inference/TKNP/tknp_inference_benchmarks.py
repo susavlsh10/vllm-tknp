@@ -6,7 +6,7 @@ Token parallelism:
 torchrun --nproc-per-node=4 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 1 --token-parallel-size 4 --batch-size 32 --seq-length 32768
 
 Tensor parallelism:
-torchrun --nproc-per-node=4 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 4 --token-parallel-size 1 --batch-size 32 --seq-length 16384
+torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 8 --token-parallel-size 1 --batch-size 32 --seq-length 16384
 
 Pipeline parallelism:
 torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 4 --pipeline-parallel-size 2 --batch-size 32 --seq-length 32768
@@ -20,6 +20,7 @@ Qwen:       Qwen/Qwen2.5-1.5B-Instruct, Qwen/Qwen3-4B-Instruct-2507
             Qwen/Qwen3-32B, Qwen/Qwen2.5-72B-Instruct
 
 Ministral:  ministral/Ministral-3b-instruct
+            mistralai/Devstral-Small-2-24B-Instruct-2512
 
 """
 
@@ -450,10 +451,11 @@ def run_inference_benchmark(args, llm, batch_size, seq_length):
     
     prompts = None
     if dist.get_rank() == 0:
+        tokenizer = llm.get_tokenizer()
         prompts = generate_benchmark_prompts(
             batch_size=batch_size,
             seq_length=seq_length,
-            tokenizer=None,
+            tokenizer=tokenizer,
             model_name=args.model,
             vocab_style="natural",
             seed=42

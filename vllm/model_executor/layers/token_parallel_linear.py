@@ -447,6 +447,7 @@ class TokenParallelRowLinear(RowParallelLinear):
             self.register_parameter('weight', None)
             if getattr(self, "bias", None) is not None:
                 self.register_parameter('bias', None)
+            self.quant_method = None 
 
         # ---- pre-allocate communication buffer (root only) -----------
         self._buf_pool = _CommBufferPool()
