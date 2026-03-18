@@ -22,8 +22,9 @@ CONTAINER_WORKDIR=/home/sshrestha/workspace/2026/vllm-tknp
 
 # Model configuration
 # MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_NAME="meta-llama/Llama-3.3-70B-Instruct"
-# MODEL_NAME="Qwen/Qwen3-32B"
+# MODEL_NAME="meta-llama/Llama-3.3-70B-Instruct"
+# MODEL_NAME="Qwen/Qwen2.5-32B"
+MODEL_NAME="mistralai/Devstral-Small-2-24B-Instruct-2512"
 
 # Benchmark parameters
 BATCH_SIZE=64

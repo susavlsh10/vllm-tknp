@@ -17,10 +17,10 @@ Supported models:
 Llama-3:    meta-llama/Llama-3.2-1B-Instruct, meta-llama/Llama-3.2-3B-Instruct, 
             meta-llama/Llama-3.1-8B-Instruct, meta-llama/Llama-3.3-70B-Instruct
 Qwen:       Qwen/Qwen2.5-1.5B-Instruct, Qwen/Qwen3-4B-Instruct-2507
-            Qwen/Qwen3-32B, Qwen/Qwen2.5-72B-Instruct
+            Qwen/Qwen3-32B, Qwen/Qwen2.5-32B, Qwen/Qwen2.5-72B-Instruct
 
 Ministral:  ministral/Ministral-3b-instruct
-            mistralai/Devstral-Small-2-24B-Instruct-2512
+            mistralai/Devstral-Small-2-24B-Instruct-2512, mistralai/Mistral-Large-Instruct-557161
 
 """
 
