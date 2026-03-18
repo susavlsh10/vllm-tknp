@@ -94,50 +94,8 @@ In the attention layer, we would already have the KV cache populated from the pr
 The input to the attention layer would be a tensor of shape input_attention = [batch_size, hidden_dim]. The root rank(s) compute the QKV projection out_qkv_proj = [batch_size, qkv_proj_dim]. At this stage, we scatter the requests in the batch dimension to the token parallel groups. If we have a token parallel size = TKNP_size, each GPU in the token parallel group will receive a tensor of shape [batch_size // TKNP_size, qkv_proj_dim]. Ideally, we would have a way to configure the number of requests processed by the root node and the number of requests scattered to the attention nodes. Since the root node has lower amount of free GPU memory available compared to the attention node, it should have a lower space available for its KV cache -> requires smaller local batch size. 
 
 
-# Implementation status
-
-We want to implement token parallel in vLLM framework. 
-
-* Parallel states: Implementation complete. vllm/distributed/parallel_state.py
-* Token parallel classes: A prototype has been implemeted in vllm/model_executor/layers/token_parallel_linear.py
-* Model integration: The token parallel linear classes have been integrated in vllm/model_executor/models/llama_tknp.py but haven't been tested yet.
-
 ---
 
-# TODO
-
-We want to implement this architecture in vLLM and support a wide range of models. We want to implement this in vLLM v1 architecture.
-
-vLLM KV cache management
-+ Learn how vLLM manages KV cache for each request
-+ Each token parallel attention node only needs to store the KV cache for a subset of the batch or requests. 
-+ How can we do this in vLLM?
-+ Which modules do we need to update and how do we update them? 
-
-
-Token Parallel Inference 
-+ During prefill, we compute the KV cache in the root node and send the KV cache of a subset of the requests to the attention nodes. 
-+ The prefill step needs to be here for compatibility. Ideally, we are operating in a disaggregated system where we have a different prefill and decode systems. In such a system, our token parallel server only perform the decode stage (after we get the KV cache from the prefill server)
-
-Key components that might require changes: 
-+ Scheduler
-+ KV Cache Manager
-+ Attention 
-+ Study the inference code and find any other components to be updated
-
-**Update Attention calls**: 
-
-+ Each token parallel attention rank will receive qkv for its respective set of requests. (NOTE: we need to make the scatter more flexible)
-+ Each TKNP rank is responsible for caching the vectors to the KV cache 
-+ The KV cache management in each TKNP rank will be different; we need to study how to do this.
-+ Different requests will be assigned to each TKNP rank; These requests should utilize the KV cache efficiently (should utilize all request)
-+ allocate_slots reserves blocks; block_table maps requests to block ids. Needs work.
-
-
-## Limitations
-+ Scheduling: Block wise scheduling
-    * Need to support continuous batching and token aware scheduling
-    
 
 ## End to end generation 
 
@@ -148,29 +106,6 @@ torchrun --nproc-per-node=2 TKNP/test_torchrun.py --tensor-parallel-size 2
 # 2 GPUs with token parallel enabled
 torchrun --nproc-per-node=2 TKNP/test_torchrun.py --tensor-parallel-size 1 --enable-token-parallel --token-parallel-size 2
 ```
-
-# Key things TODO:
-
-1. In token parallel attention ranks, we need to make sure that we are allocating more memory KV cache as we have more memory available compared to the root nodes with the model weights.
-    + This allows us to run larger batch sizes and longer sequence lengths in these ranks.
-
-2. Scheduler 
-    + We added a scheduler helper to assign requests to token parallel ranks. 
-    + Currently a simple round robin method is used: in the future we need to make this much more capable. 
-    + The token parallel scheduler needs to account for the number of tokens in each ranks and balance the load across the token parallel world. 
-    + The scheduler also calls the allocate_slots function; need to update this. 
-
-3. Update KVCacheManager, allocate_slots
-    + We need to introduce logic which only allocates slots for the required number of requests for the current rank.
-    + The scheduler decides which ranks is responsible for which requests. 
-    + Each rank should only be responsible for its own set of requests. 
-
-4. Update input batch with scheduler output (gpu_model_runner.py : _prepare_inputs)
-    + The order of the input tokens need to be updated with scheduler output, check GPUModelRunner (_may_reorder_batch)
-    + [---- Root Node Tokens -----][---- Attn Node 1 Tokens ----][----Attn Node 2 Tokens ----][ ....... ]
-    + We also need to update the positions tensor to only include the position data for local tokens.
-    + Added new methods in gpu_model_runner : _maybe_reorder_requests_for_token_parallel, _build_token_parallel_metadata_prefill, 
-
 
 #### Debug script 
 
