@@ -1220,7 +1220,12 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    tknp_ctx = (
+        get_tknp_group().graph_capture(context)
+        if is_tknp_initialized()
+        else nullcontext()
+    )
+    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context), tknp_ctx:
         yield context
 
 

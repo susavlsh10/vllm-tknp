@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -24,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.forward_context import compute_capacity_aware_tknp_split
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -394,7 +396,19 @@ class TokenParallelScheduler:
             total_lifetime_tokens += (prompt_len + max_output)
 
         avg_lifetime_tokens = total_lifetime_tokens / num_unassigned
-        blocks_per_req = max(1, math.ceil(avg_lifetime_tokens / self.block_size))
+        graph_request_tokens = int(
+            os.environ.get("VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS", "0")
+        )
+        if graph_request_tokens > 0:
+            # Homogeneous CUDA Graph POC: capture and scheduling must use the
+            # same fixed lifetime estimate for warmup and measured runs.
+            blocks_per_req = max(
+                1, math.ceil(graph_request_tokens / self.block_size)
+            )
+        else:
+            blocks_per_req = max(
+                1, math.ceil(avg_lifetime_tokens / self.block_size)
+            )
 
         # ------------------------------------------------------------------
         # 1) Determine per-rank capacity (max requests that fit).
@@ -410,77 +424,14 @@ class TokenParallelScheduler:
                 use_capacity_aware = False
 
         if use_capacity_aware:
-            # Maximum number of new requests each rank can accommodate
-            # over their full lifetime.
-            capacity_per_rank = np.array(
-                [int(f // blocks_per_req) for f in free],
+            assigned_counts = np.asarray(
+                compute_capacity_aware_tknp_split(
+                    num_requests=num_unassigned,
+                    blocks_per_request=blocks_per_req,
+                    free_blocks_per_rank=free.tolist(),
+                ),
                 dtype=np.int32,
             )
-
-            root_capacity = int(capacity_per_rank[0])
-            num_non_root = self.tknp_world_size - 1
-
-            # ------------------------------------------------------------------
-            # 2) Compute balanced assignment with root hard-capped.
-            #
-            #    Target: all ranks get the same count (ideal even split),
-            #    but root is hard-capped at root_capacity.  Any requests
-            #    that root cannot take are redistributed evenly across
-            #    non-root ranks.
-            # ------------------------------------------------------------------
-            even_share = num_unassigned // self.tknp_world_size
-            even_remainder = num_unassigned % self.tknp_world_size
-
-            # Root gets at most even_share, and never more than its capacity.
-            root_count = min(even_share, root_capacity)
-            # print(f"Root count: {root_count}, Root capacity: {root_capacity}")
-
-            if num_non_root > 0:
-                # Requests that need to go to non-root ranks.
-                remaining = num_unassigned - root_count
-
-                non_root_base = remaining // num_non_root
-                non_root_remainder = remaining % num_non_root
-
-                assigned_counts = np.zeros(self.tknp_world_size,
-                                           dtype=np.int32)
-                assigned_counts[0] = root_count
-
-                for r in range(1, self.tknp_world_size):
-                    count = non_root_base
-                    if r - 1 < non_root_remainder:
-                        count += 1
-                    # Hard-cap to what this rank can actually hold.
-                    count = min(count, int(capacity_per_rank[r]))
-                    assigned_counts[r] = count
-
-                # If clamping reduced the total, push overflow to ranks
-                # with remaining capacity (non-root first, then root).
-                assigned_so_far = int(assigned_counts.sum())
-                shortfall = num_unassigned - assigned_so_far
-                if shortfall > 0:
-                    for r in range(1, self.tknp_world_size):
-                        room = int(capacity_per_rank[r]) - assigned_counts[r]
-                        give = min(room, shortfall)
-                        assigned_counts[r] += give
-                        shortfall -= give
-                        if shortfall <= 0:
-                            break
-                if shortfall > 0:
-                    # Last resort: root absorbs more (may OOM but nothing
-                    # else can be done — total system capacity is exceeded).
-                    assigned_counts[0] += shortfall
-                    # print(f"Warning: total capacity exceeded by {shortfall} requests; assigned more to root rank.")
-
-                    # throw an error that we can catch upstream to mark these requests as failed due to capacity issues
-                    raise RuntimeError(
-                        f"Unable to schedule {shortfall} requests due to insufficient "
-                        f"capacity across all ranks. Assigned: {assigned_counts.tolist()}, "
-                        f"Capacity: {capacity_per_rank.tolist()}"
-                    )
-            else:
-                # Only root rank exists (world_size == 1).
-                assigned_counts = np.array([num_unassigned], dtype=np.int32)
 
         # print(f"[Rank {self.rank}] Assigned counts before fallback: {assigned_counts}, Capacity per rank: {capacity_per_rank if use_capacity_aware else 'N/A'}")
         # ------------------------------------------------------------------

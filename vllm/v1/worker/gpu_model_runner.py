@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import math
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -51,6 +53,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    compute_capacity_aware_tknp_split,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -481,6 +484,29 @@ class GPUModelRunner(
             self.cudagraph_batch_sizes = sorted(
                 self.compilation_config.cudagraph_capture_sizes
             )
+            if is_tknp_initialized() and get_tknp_world_size() > 1:
+                # The single Dynamo trace expresses every attention shard as
+                # global_tokens / TKNP world size. Capture only evenly
+                # shardable sizes so every rank participates with the same
+                # fixed shape. Smaller/non-divisible batches are padded by the
+                # dispatcher to a retained graph size when one is available.
+                tknp_world_size = get_tknp_world_size()
+                self.cudagraph_batch_sizes = [
+                    size
+                    for size in self.cudagraph_batch_sizes
+                    if size >= tknp_world_size
+                    and size % tknp_world_size == 0
+                ]
+                self.compilation_config.cudagraph_capture_sizes = list(
+                    self.cudagraph_batch_sizes
+                )
+                # TKNP local shard sizes depend on the padded batch size,
+                # so the general dynamic compile range cannot safely bake
+                # a single `tokens_per_rank` split. Force concrete compile
+                # entries for every CUDA-graph capture size up front.
+                compile_sizes = set(self.compilation_config.compile_sizes or [])
+                compile_sizes.update(int(x) for x in self.cudagraph_batch_sizes)
+                self.compilation_config.compile_sizes = sorted(compile_sizes)
 
         # Cache the device properties.
         self._init_device_properties()
@@ -617,6 +643,14 @@ class GPUModelRunner(
         
         # TKNP
         self.root_rank = is_root_rank()
+        self._tknp_graph_splits: dict[int, list[int]] = {}
+        self._tknp_logged_replay_keys: set[tuple[int, tuple[int, ...]]] = set()
+
+    @staticmethod
+    def _normalize_tknp_tokens_per_rank(tokens_per_rank: Any) -> list[int]:
+        if isinstance(tokens_per_rank, np.ndarray):
+            return [int(x) for x in tokens_per_rank.tolist()]
+        return [int(x) for x in tokens_per_rank]
 
     def _build_token_parallel_metadata(
         self,
@@ -633,9 +667,20 @@ class GPUModelRunner(
         Returns:
             TokenParallelMetadata with rank assignments.
         """
-        stage = "mixed" # vllm batches both prefill and decode together
-        tokens_per_rank = scheduler_output.token_parallel_allocations.tknp_tokens_per_rank_cache
+        stage = "mixed"  # vllm batches both prefill and decode together
+        allocations = scheduler_output.token_parallel_allocations
+        assert allocations is not None
+        tokens_per_rank = self._normalize_tknp_tokens_per_rank(
+            allocations.tknp_tokens_per_rank_cache
+        )
         rank = get_tknp_rank()
+        req_to_rank = allocations.req_to_tknp_rank
+        rank_request_indices = [[] for _ in range(get_tknp_world_size())]
+        request_to_rank: list[int] = []
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            req_rank = int(req_to_rank.get(req_id, 0))
+            request_to_rank.append(req_rank)
+            rank_request_indices[req_rank].append(req_idx)
 
         return TokenParallelMetadata(
             num_reqs=self.input_batch.num_reqs,
@@ -645,7 +690,9 @@ class GPUModelRunner(
             tknp_rank=rank,
             token_parallel_world_size=get_tknp_world_size(),
             tokens_per_rank=tokens_per_rank,
-            local_num_tokens=tokens_per_rank[rank],
+            request_to_rank=request_to_rank,
+            rank_request_indices=rank_request_indices,
+            local_num_tokens=int(tokens_per_rank[rank]),
         )
         
     def _tknp_out_sync(self, sampler_output, async_op: bool = True):
@@ -673,6 +720,17 @@ class GPUModelRunner(
         # # Store the work handle so we can wait later if needed
         return work
 
+    def _tknp_split_matches_cudagraph(
+        self,
+        tknp_metadata: TokenParallelMetadata,
+        num_tokens_padded: int,
+    ) -> bool:
+        expected = self._tknp_graph_splits.get(num_tokens_padded)
+        if expected is None:
+            return False
+        actual = self._normalize_tknp_tokens_per_rank(tknp_metadata.tokens_per_rank)
+        return actual == expected
+
     def _slice_tknp_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -689,6 +747,7 @@ class GPUModelRunner(
         torch.Tensor,  # sliced logits_indices
         dict[str, int],  # sliced num_scheduled_tokens dict
         list[int],  # local_req_indices for block table slicing
+        dict[str, Any],  # restore state for global buffers
     ]:
         """
         Slice inputs for token parallel inference before building attention metadata.
@@ -722,7 +781,7 @@ class GPUModelRunner(
         if not local_req_indices:
             # This rank has no requests - return empty/minimal values
             empty_logits = torch.zeros(0, dtype=logits_indices.dtype, device=logits_indices.device)
-            return 0, 0, np.array([], dtype=np.int32), 0, empty_logits, {}, []
+            return 0, 0, np.array([], dtype=np.int32), 0, empty_logits, {}, [], {}
         
         # Slice num_scheduled_tokens array
         local_num_scheduled_tokens_np = num_scheduled_tokens_np[local_req_indices]
@@ -770,6 +829,15 @@ class GPUModelRunner(
             device=logits_indices.device
         )
         
+        restore_state: dict[str, Any] = {
+            "num_reqs": num_reqs,
+            "num_tokens": num_tokens_unpadded,
+            "query_start_loc": self.query_start_loc.np.copy(),
+            "seq_lens": self.seq_lens.np.copy(),
+            "slot_mappings": [],
+            "block_tables": [],
+        }
+
         # Update query_start_loc for local requests
         # local_cu_tokens is [0, cumsum[0], cumsum[1], ...] with length local_num_reqs + 1
         local_cu_tokens = np.cumsum(local_num_scheduled_tokens_np)
@@ -794,6 +862,7 @@ class GPUModelRunner(
             global_slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded].clone()
             local_slot_mapping = global_slot_mapping[local_token_indices]
             blk_table.slot_mapping.gpu[:local_num_tokens].copy_(local_slot_mapping)
+            restore_state["slot_mappings"].append((kv_cache_gid, global_slot_mapping))
             
             # Slice block table to only local requests
             # Note: block_table.get_device_tensor will be called later with local_num_reqs
@@ -801,6 +870,7 @@ class GPUModelRunner(
             global_block_table = blk_table.get_device_tensor(num_reqs).clone()
             local_block_table = global_block_table[local_req_indices]
             blk_table.get_device_tensor(local_num_reqs)[:local_num_reqs].copy_(local_block_table)
+            restore_state["block_tables"].append((kv_cache_gid, global_block_table))
         
         return (
             local_num_tokens,
@@ -810,7 +880,27 @@ class GPUModelRunner(
             local_logits_indices,
             local_num_scheduled_tokens_dict,
             local_req_indices,
+            restore_state,
         )
+
+    def _restore_tknp_inputs(self, restore_state: dict[str, Any]) -> None:
+        if not restore_state:
+            return
+
+        num_reqs = int(restore_state["num_reqs"])
+        num_tokens = int(restore_state["num_tokens"])
+        self.query_start_loc.np[:] = restore_state["query_start_loc"]
+        self.query_start_loc.copy_to_gpu()
+        self.seq_lens.np[:] = restore_state["seq_lens"]
+        self.seq_lens.copy_to_gpu()
+
+        for kv_cache_gid, slot_mapping in restore_state["slot_mappings"]:
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            blk_table.slot_mapping.gpu[:num_tokens].copy_(slot_mapping)
+
+        for kv_cache_gid, block_table in restore_state["block_tables"]:
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            blk_table.get_device_tensor(num_reqs)[:num_reqs].copy_(block_table)
     
     # works better, fixes continuous batching
     def _tknp_slicing(
@@ -830,7 +920,7 @@ class GPUModelRunner(
             positions (torch.Tensor): The complete positions tensors for all requests
         """
         rank = tknp_metadata.tknp_rank
-        num_actual_tokens = tknp_metadata.local_num_tokens.item()
+        num_actual_tokens = int(tknp_metadata.local_num_tokens or 0)
         tokens_per_rank = tknp_metadata.tokens_per_rank
         
         # global sequence lengths
@@ -930,6 +1020,11 @@ class GPUModelRunner(
                 # Slice block tables
                 new_block_table = metadata.block_table[local_req_indices].contiguous()
                 metadata.block_table = new_block_table
+
+                if hasattr(metadata, "scheduler_metadata"):
+                    metadata.scheduler_metadata = None
+                if hasattr(metadata, "prefix_scheduler_metadata"):
+                    metadata.prefix_scheduler_metadata = None
                 
                 processed_metadata_ids.add(metadata_id)
                 
@@ -964,15 +1059,71 @@ class GPUModelRunner(
             return positions[:, local_token_indices].contiguous()
         else:
             return positions[local_token_indices].contiguous()
-    
-    def _tknp_dummy_setup(self, num_tokens: int, num_reqs: int, positions: torch.Tensor): 
+
+    @staticmethod
+    def _balanced_tknp_split(num_items: int, world_size: int) -> list[int]:
+        """Match the scheduler's balanced TKNP assignment for a fresh batch.
+
+        Remainders go to non-root ranks first because the scheduler preserves
+        root KV capacity. CUDA Graph capture and replay must use the same
+        deterministic split for a given global batch size.
+        """
+        base = num_items // world_size
+        remainder = num_items % world_size
+        counts = [base] * world_size
+        for r in range(remainder):
+            counts[(r + 1) % world_size] += 1
+        return counts
+
+    @staticmethod
+    def _dummy_tknp_request_indices(
+        num_reqs: int,
+        world_size: int,
+        rank: int,
+        counts: list[int] | None = None,
+    ) -> list[int]:
+        """Return the contiguous dummy request block owned by one TKNP rank."""
+        if counts is None:
+            counts = GPUModelRunner._balanced_tknp_split(num_reqs, world_size)
+        if len(counts) != world_size or sum(counts) != num_reqs:
+            raise ValueError(
+                f"Invalid dummy TKNP request split {counts} for "
+                f"num_reqs={num_reqs}, world_size={world_size}"
+            )
+        start = sum(counts[:rank])
+        count = counts[rank]
+        return list(range(start, start + count))
+
+    def _tknp_dummy_setup(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        is_profile: bool = False,
+        is_graph_capturing: bool = False,
+    ):
+        """Build TKNP metadata for dummy / warmup / graph-capture runs.
+
+        Returns:
+            (tknp_metadata, positions, input_ids, inputs_embeds)
+        CUDA Graph warmups/capture mirror replay exactly: root keeps global
+        embedding inputs, non-root ranks receive local embedding inputs, and
+        all ranks receive local positions. The memory-profile run retains the
+        global dynamic placeholders used by the general compile range.
+        """
         world_size = get_tknp_world_size()
         rank = get_tknp_rank()
-        base = num_tokens // world_size
-        remainder = num_tokens % world_size
-        tokens_per_rank = [
-            base + (1 if r < remainder else 0) for r in range(world_size)
-        ]
+
+        # Use pre-computed scheduler-compatible splits for graph sizes.
+        if num_tokens in self._tknp_graph_splits:
+            tokens_per_rank = self._tknp_graph_splits[num_tokens]
+        else:
+            tokens_per_rank = self._balanced_tknp_split(
+                num_tokens, world_size
+            )
+
         rank_start_loc: list[int] = []
         rank_end_loc: list[int] = []
         offset = 0
@@ -980,18 +1131,36 @@ class GPUModelRunner(
             rank_start_loc.append(offset)
             offset += count
             rank_end_loc.append(offset)
+
+        # Profile, warmup, capture, and replay must all trace the same local
+        # attention shape. Root keeps global embedding inputs for QKV compute;
+        # non-root embedding placeholders and rotary positions are local.
         local_start = rank_start_loc[rank]
         local_end = rank_end_loc[rank]
-
         if self.uses_mrope:
             positions = positions[:, local_start:local_end]
         else:
             positions = positions[local_start:local_end]
+        if rank != 0:
+            if input_ids is not None:
+                input_ids = input_ids[:tokens_per_rank[rank]]
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds[:tokens_per_rank[rank]]
 
-        request_to_rank = [idx % world_size for idx in range(num_reqs)]
+        request_counts = (
+            list(tokens_per_rank)
+            if num_reqs == num_tokens
+            else self._balanced_tknp_split(num_reqs, world_size)
+        )
+        request_to_rank = [0] * num_reqs
         rank_request_indices = [[] for _ in range(world_size)]
-        for idx, r in enumerate(request_to_rank):
-            rank_request_indices[r].append(idx)
+        for r in range(world_size):
+            indices = self._dummy_tknp_request_indices(
+                num_reqs, world_size, r, request_counts
+            )
+            rank_request_indices[r] = indices
+            for idx in indices:
+                request_to_rank[idx] = r
 
         tknp_metadata = TokenParallelMetadata(
             num_reqs=num_reqs,
@@ -1006,11 +1175,101 @@ class GPUModelRunner(
             request_to_rank=request_to_rank,
             rank_request_indices=rank_request_indices,
             rank_token_spans=[[] for _ in range(world_size)],
-            local_num_tokens=tokens_per_rank[rank],
-            _dummy_run=True,
+            local_num_tokens=int(tokens_per_rank[rank]),
+            _dummy_run=not is_graph_capturing,
+            is_cuda_graph=is_graph_capturing,
         )
-        
-        return tknp_metadata, positions
+        tknp_metadata._compile_local_shape_source = positions
+
+        return tknp_metadata, positions, input_ids, inputs_embeds
+
+    def _compute_tknp_graph_splits(self) -> None:
+        """Pre-compute scheduler-compatible splits for CUDA Graph sizes.
+
+        For the homogeneous-request CUDA Graph POC, the benchmark provides a
+        fixed request-lifetime hint. Capture and scheduling use that same hint
+        plus the per-rank KV capacities, producing identical local shapes.
+
+        Must be called **after** ``initialize_kv_cache()`` (so that
+        ``self.kv_cache_config`` is available) and **before**
+        ``capture_model()``.
+
+        Populates ``self._tknp_graph_splits``: a dict mapping total padded
+        token count → ``list[int]`` of per-rank token counts.
+        """
+        world_size = get_tknp_world_size()
+        self._tknp_graph_splits: dict[int, list[int]] = {}
+
+        if world_size <= 1:
+            return
+
+        request_tokens = int(
+            os.environ.get("VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS", "0")
+        )
+        require_cudagraph = (
+            os.environ.get("VLLM_TKNP_REQUIRE_CUDAGRAPH", "0") == "1"
+        )
+        if request_tokens <= 0:
+            if require_cudagraph:
+                raise RuntimeError(
+                    "VLLM_TKNP_REQUIRE_CUDAGRAPH=1 requires "
+                    "VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS for fixed-shape capture"
+                )
+            for n in self.cudagraph_batch_sizes:
+                self._tknp_graph_splits[n] = self._balanced_tknp_split(
+                    n, world_size
+                )
+            return
+
+        local_blocks = torch.tensor(
+            [self.kv_cache_config.num_blocks], dtype=torch.int64, device="cpu"
+        )
+        gathered_blocks = [torch.zeros_like(local_blocks) for _ in range(world_size)]
+        torch.distributed.all_gather(
+            gathered_blocks,
+            local_blocks,
+            group=get_tknp_group().cpu_group,
+        )
+        free_blocks = [int(item.item()) for item in gathered_blocks]
+        blocks_per_request = max(
+            1, math.ceil(request_tokens / self.cache_config.block_size)
+        )
+
+        for n in self.cudagraph_batch_sizes:
+            self._tknp_graph_splits[n] = compute_capacity_aware_tknp_split(
+                num_requests=n,
+                blocks_per_request=blocks_per_request,
+                free_blocks_per_rank=free_blocks,
+            )
+
+        # Piecewise compilation dispatches on the first symbolic tensor
+        # dimension. Root ranks see the global token count; non-root TKNP
+        # ranks see their local shard count. Give each process the exact set
+        # of compile sizes it will encounter while the CUDA Graph dispatcher
+        # continues to use the global capture sizes.
+        rank = get_tknp_rank()
+        if rank == 0:
+            compile_sizes = set(int(n) for n in self.cudagraph_batch_sizes)
+        else:
+            compile_sizes = {
+                int(split[rank])
+                for split in self._tknp_graph_splits.values()
+                if split[rank] > 0
+            }
+        self.compilation_config.compile_sizes = sorted(compile_sizes)
+
+        if is_global_first_rank():
+            logger.info(
+                "TKNP capacity-aware CUDA Graph variants: request_tokens=%d, "
+                "blocks_per_request=%d, free_blocks=%s, variants=%s",
+                request_tokens,
+                blocks_per_request,
+                free_blocks,
+                {
+                    size: tuple(self._tknp_graph_splits[size])
+                    for size in self.cudagraph_batch_sizes
+                },
+            )
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -3164,6 +3423,7 @@ class GPUModelRunner(
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        global_num_tokens: int | None = None,
         **model_kwargs: dict[str, Any],
     ) -> Any:
         """Helper method to call the model forward pass.
@@ -3177,6 +3437,10 @@ class GPUModelRunner(
             positions: Token positions
             intermediate_tensors: Tensors from previous pipeline stages
             inputs_embeds: Input embeddings (alternative to input_ids)
+            global_num_tokens: Global (padded) token count for TKNP
+                non-root replacement.  When set, the output is always
+                replaced with a global-sized zero tensor so that
+                downstream logits_indices indexing works correctly.
             **model_kwargs: Additional model arguments
 
         Returns:
@@ -3189,14 +3453,24 @@ class GPUModelRunner(
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
-        # if is_tknp_initialized() and outputs is None:
-        #     outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
 
-        if is_tknp_initialized() and outputs is None:
-            # outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
+        # On non-root TKNP ranks the model output (local-sized) is not
+        # used for logits / sampling (root's output is broadcast).
+        # Replace with a global-sized zero tensor so that the
+        # logits_indices indexing later never goes out-of-bounds.
+        if is_tknp_initialized() and not self.root_rank:
             _ref = input_ids if input_ids is not None else inputs_embeds
-            outputs = torch.zeros(_ref.size(0), self.model_config.get_hidden_size(),
-                                dtype=self.model_config.dtype, device=_ref.device)
+            target_size = (
+                global_num_tokens
+                if global_num_tokens is not None
+                else _ref.size(0)
+            )
+            outputs = torch.zeros(
+                target_size,
+                self.model_config.get_hidden_size(),
+                dtype=self.model_config.dtype,
+                device=_ref.device,
+            )
 
         return outputs
 
@@ -3405,6 +3679,7 @@ class GPUModelRunner(
             scheduler_output = deepcopy(scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        tknp_restore_state: dict[str, Any] = {}
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -3516,63 +3791,23 @@ class GPUModelRunner(
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-                # TKNP debug
-                # print inputs to build attention metadata
-                if is_tknp_initialized() and get_tknp_world_size() > 1:
-                    (
-                        new_num_tokens_unpadded,
-                        new_num_reqs,
-                        new_num_scheduled_tokens_np,
-                        new_max_num_scheduled_tokens,
-                        new_logits_indices,
-                        local_num_scheduled_tokens_dict,
-                        local_req_indices,
-                    ) = self._slice_tknp_inputs(
-                        scheduler_output,
-                        num_tokens_unpadded,
-                        num_reqs,
-                        num_scheduled_tokens_np,
-                        max_num_scheduled_tokens,
-                        logits_indices,
+                # Build attention metadata after _prepare_inputs populates the
+                # persistent query_start_loc / seq_lens / slot_mapping buffers.
+                # For TKNP we will rebuild a local view after _preprocess().
+                (attn_metadata, spec_decode_common_attn_metadata) = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded if pad_attn else None,
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     )
-                    # Update padded values for the local subset
-                    num_tokens_padded = num_tokens_unpadded  # May need padding logic
-                    num_reqs_padded = num_reqs
-
-                    # handle empty batch case 
-                    if new_num_reqs == 0:
-                        attn_metadata = {}
-                        spec_decode_common_attn_metadata = None
-                    else:
-                        (attn_metadata, spec_decode_common_attn_metadata) = (
-                            self._build_attention_metadata(
-                                num_tokens=new_num_tokens_unpadded,
-                                num_tokens_padded=num_tokens_padded if pad_attn else None,
-                                num_reqs=new_num_reqs,
-                                num_reqs_padded=num_reqs_padded if pad_attn else None,
-                                max_query_len=new_max_num_scheduled_tokens,
-                                ubatch_slices=ubatch_slices_attn,
-                                logits_indices=new_logits_indices,
-                                use_spec_decode=use_spec_decode,
-                                num_scheduled_tokens=local_num_scheduled_tokens_dict,
-                                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                            )
-                        )
-                else:
-                    (attn_metadata, spec_decode_common_attn_metadata) = (
-                        self._build_attention_metadata(
-                            num_tokens=num_tokens_unpadded,
-                            num_tokens_padded=num_tokens_padded if pad_attn else None,
-                            num_reqs=num_reqs,
-                            num_reqs_padded=num_reqs_padded if pad_attn else None,
-                            max_query_len=max_num_scheduled_tokens,
-                            ubatch_slices=ubatch_slices_attn,
-                            logits_indices=logits_indices,
-                            use_spec_decode=use_spec_decode,
-                            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                        )
-                    )
+                )
 
             (
                 input_ids,
@@ -3590,17 +3825,123 @@ class GPUModelRunner(
                     scheduler_output,
                     int(scheduler_output.total_num_scheduled_tokens),
                 )
-                # Slice positions to only local tokens
-                positions = self._slice_positions_for_tknp(
-                    positions, 
-                    scheduler_output, 
+
+                # In CUDA graph mode, override tokens_per_rank with
+                # pre-computed fixed splits so the NCCL ops use constant
+                # sizes that match the captured graph.
+                if (cudagraph_mode is not None
+                        and cudagraph_mode != CUDAGraphMode.NONE
+                        and num_tokens_padded in self._tknp_graph_splits):
+                    if self._tknp_split_matches_cudagraph(
+                        tknp_metadata, num_tokens_padded
+                    ):
+                        tknp_metadata.tokens_per_rank = list(
+                            self._tknp_graph_splits[num_tokens_padded]
+                        )
+                        tknp_metadata.local_num_tokens = int(
+                            tknp_metadata.tokens_per_rank[get_tknp_rank()]
+                        )
+                        tknp_metadata.is_cuda_graph = True
+                        replay_key = (
+                            num_tokens_padded,
+                            tuple(tknp_metadata.tokens_per_rank),
+                        )
+                        if replay_key not in self._tknp_logged_replay_keys:
+                            logger.info(
+                                "TKNP_CUDAGRAPH_REPLAY padded_size=%d split=%s",
+                                replay_key[0],
+                                replay_key[1],
+                            )
+                            self._tknp_logged_replay_keys.add(replay_key)
+                    else:
+                        raise RuntimeError(
+                            "TKNP CUDA Graph split mismatch: runtime split "
+                            f"{tuple(tknp_metadata.tokens_per_rank)} != captured "
+                            f"split {tuple(self._tknp_graph_splits[num_tokens_padded])} "
+                            f"for padded size {num_tokens_padded}. Eager fallback "
+                            "is disabled."
+                        )
+
+                if os.environ.get("VLLM_TKNP_REQUIRE_CUDAGRAPH", "0") == "1":
+                    if cudagraph_mode == CUDAGraphMode.NONE:
+                        raise RuntimeError(
+                            "TKNP CUDA Graph execution was required but the "
+                            f"dispatcher selected NONE for padded size "
+                            f"{num_tokens_padded}. Eager fallback is disabled."
+                        )
+                    if not tknp_metadata.is_cuda_graph:
+                        raise RuntimeError(
+                            "TKNP CUDA Graph execution was required but no exact "
+                            f"captured split exists for padded size "
+                            f"{num_tokens_padded}. Eager fallback is disabled."
+                        )
+
+                (
+                    local_num_tokens,
+                    local_num_reqs,
+                    local_num_scheduled_tokens_np,
+                    local_max_num_scheduled_tokens,
+                    local_logits_indices,
+                    local_num_scheduled_tokens_dict,
                     local_req_indices,
+                    tknp_restore_state,
+                ) = self._slice_tknp_inputs(
+                    scheduler_output,
+                    num_tokens_unpadded,
+                    num_reqs,
                     num_scheduled_tokens_np,
+                    max_num_scheduled_tokens,
+                    logits_indices,
                 )
-                # tknp slicing
-                # attn_metadata, positions = self._tknp_slicing(scheduler_output, attn_metadata, tknp_metadata, positions)
+
+                # On non-root TKNP ranks, slice model inputs to the
+                # local token count so that tensor dimensions are
+                # consistent throughout the model forward (required for
+                # CUDA-graph replay whose capture used local sizes).
+                if not self.root_rank:
+                    local_count = int(tknp_metadata.local_num_tokens or 0)
+                    if input_ids is not None:
+                        input_ids = input_ids[:local_count]
+                    if inputs_embeds is not None:
+                        inputs_embeds = inputs_embeds[:local_count]
+
+                if local_num_reqs == 0:
+                    attn_metadata = {}
+                    spec_decode_common_attn_metadata = None
+                    positions = positions[:0] if not self.uses_mrope else positions[:, :0]
+                else:
+                    pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+                    ubatch_slices_attn = (
+                        ubatch_slices_padded if pad_attn else ubatch_slices
+                    )
+                    (attn_metadata, spec_decode_common_attn_metadata) = (
+                        self._build_attention_metadata(
+                            num_tokens=local_num_tokens,
+                            num_tokens_padded=local_num_tokens if pad_attn else None,
+                            num_reqs=local_num_reqs,
+                            num_reqs_padded=local_num_reqs if pad_attn else None,
+                            max_query_len=local_max_num_scheduled_tokens,
+                            ubatch_slices=ubatch_slices_attn,
+                            logits_indices=local_logits_indices,
+                            use_spec_decode=use_spec_decode,
+                            num_scheduled_tokens=local_num_scheduled_tokens_dict,
+                            cascade_attn_prefix_lens=None,
+                        )
+                    )
+                    positions = self._slice_positions_for_tknp(
+                        positions,
+                        scheduler_output,
+                        local_req_indices,
+                        local_num_scheduled_tokens_np,
+                    )
             else:
                 tknp_metadata = None
+
+        if tknp_metadata is not None:
+            # The local positions view is an actual model input, so its token
+            # dimension remains symbolic through Dynamo and can select the
+            # correct compiled TKNP shard variant.
+            tknp_metadata._compile_local_shape_source = positions
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3626,14 +3967,21 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            # print(f"[RANK {torch.distributed.get_rank()}] input_ids.shape = {input_ids.shape}, tknp_metadata= {tknp_metadata}")
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
+                global_num_tokens=(
+                    num_tokens_padded
+                    if is_tknp_initialized() and not self.root_rank
+                    else None
+                ),
                 **model_kwargs,
             )
+
+        if is_tknp_initialized() and get_tknp_world_size() > 1:
+            self._restore_tknp_inputs(tknp_restore_state)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4679,22 +5027,123 @@ class GPUModelRunner(
                 seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
             else:
                 seq_lens = max_query_len  # type: ignore[assignment]
-            self.seq_lens.np[:num_reqs] = seq_lens
-            self.seq_lens.np[num_reqs:] = 0
-            self.seq_lens.copy_to_gpu()
 
-            cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-            self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-            self.query_start_loc.copy_to_gpu()
+            # ----------------------------------------------------------
+            # TKNP: slice the dummy attention inputs to the local subset
+            # before building attention metadata.  After QKV scatter each
+            # rank only sees tokens_per_rank[rank] tokens; the attention
+            # metadata must match that count.
+            # ----------------------------------------------------------
+            if is_tknp_initialized() and get_tknp_world_size() > 1:
+                world_size = get_tknp_world_size()
+                rank = get_tknp_rank()
 
-            pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-            attn_metadata, _ = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs_padded,
-                max_query_len=max_query_len,
-                ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
-                for_cudagraph_capture=is_graph_capturing,
-            )
+                # Determine the local split (same logic as _tknp_dummy_setup)
+                if num_tokens_padded in self._tknp_graph_splits:
+                    tknp_split = self._tknp_graph_splits[num_tokens_padded]
+                else:
+                    base = num_tokens_padded // world_size
+                    rem = num_tokens_padded % world_size
+                    tknp_split = [
+                        base + (1 if r < rem else 0)
+                        for r in range(world_size)
+                    ]
+
+                local_num_tokens = tknp_split[rank]
+
+                # Keep dummy request ownership consistent with the
+                # scheduler/TKNP chunk layout: each rank owns a
+                # contiguous request block.
+                request_counts = (
+                    list(tknp_split)
+                    if num_reqs == num_tokens_padded
+                    else self._balanced_tknp_split(num_reqs, world_size)
+                )
+                local_req_indices = self._dummy_tknp_request_indices(
+                    num_reqs, world_size, rank, request_counts
+                )
+                local_num_reqs = len(local_req_indices)
+
+                # Recompute per-request token counts for local requests.
+                local_scheduled = num_scheduled_tokens[local_req_indices]
+                # The token counts were for the full batch; rescale so
+                # they sum to local_num_tokens.
+                local_total = int(local_scheduled.sum())
+                if local_total != local_num_tokens and local_num_reqs > 0:
+                    # Redistribute to match the split exactly.
+                    per_req = local_num_tokens // local_num_reqs
+                    leftover = local_num_tokens % local_num_reqs
+                    local_scheduled = np.array(
+                        [per_req + (1 if i < leftover else 0)
+                         for i in range(local_num_reqs)],
+                        dtype=np.int32,
+                    )
+
+                if local_num_tokens > 0 and local_num_reqs == 0:
+                    # Dummy graph capture can assign a positive TKNP token
+                    # shard to a rank even when the synthetic request layout
+                    # has no requests for it. Build a minimal one-request
+                    # local schedule so attention metadata, positions, and
+                    # the scattered QKV shard all describe the same token
+                    # count during compile/capture.
+                    local_num_reqs = 1
+                    local_scheduled = np.array([local_num_tokens],
+                                               dtype=np.int32)
+                    if isinstance(seq_lens, list):
+                        template_seq_len = max(seq_lens) if seq_lens else 1
+                        local_seq_lens = [template_seq_len]
+                    else:
+                        local_seq_lens = seq_lens
+                elif isinstance(seq_lens, list):
+                    local_seq_lens = [seq_lens[i] for i in local_req_indices]
+                else:
+                    local_seq_lens = seq_lens  # scalar broadcast
+
+                local_max_query_len = (
+                    int(local_scheduled.max()) if local_num_reqs > 0
+                    else 1
+                )
+
+                self.seq_lens.np[:local_num_reqs] = local_seq_lens
+                self.seq_lens.np[local_num_reqs:] = 0
+                self.seq_lens.copy_to_gpu()
+
+                local_cum, _ = self._get_cumsum_and_arange(local_scheduled)
+                self.query_start_loc.np[0] = 0
+                self.query_start_loc.np[1:local_num_reqs + 1] = local_cum
+                self.query_start_loc.np[local_num_reqs + 1:] = (
+                    local_cum[-1] if len(local_cum) > 0 else 0
+                )
+                self.query_start_loc.copy_to_gpu()
+
+                local_num_reqs_padded = local_num_reqs  # no extra padding needed for dummy
+                pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=local_num_tokens,
+                    num_reqs=local_num_reqs_padded,
+                    max_query_len=local_max_query_len,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                    for_cudagraph_capture=is_graph_capturing,
+                )
+            else:
+                # Non-TKNP path: original behaviour
+                self.seq_lens.np[:num_reqs] = seq_lens
+                self.seq_lens.np[num_reqs:] = 0
+                self.seq_lens.copy_to_gpu()
+
+                cum_num_tokens, _ = self._get_cumsum_and_arange(
+                    num_scheduled_tokens)
+                self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                self.query_start_loc.copy_to_gpu()
+
+                pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                    for_cudagraph_capture=is_graph_capturing,
+                )
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -4729,8 +5178,14 @@ class GPUModelRunner(
                 positions = self.positions.gpu[:num_tokens_padded]
                 
             if is_tknp_initialized():
-                tknp_metadata, positions = self._tknp_dummy_setup(num_tokens, num_reqs, positions)
-                # logger.info(f"[RANK {get_tknp_rank()}] tknp_metadata: {tknp_metadata}, positions: {positions}")
+                tknp_metadata, positions, input_ids, inputs_embeds = (
+                    self._tknp_dummy_setup(
+                        num_tokens_padded, num_reqs, positions,
+                        input_ids=input_ids, inputs_embeds=inputs_embeds,
+                        is_profile=is_profile,
+                        is_graph_capturing=is_graph_capturing,
+                    )
+                )
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -4769,18 +5224,42 @@ class GPUModelRunner(
                     tknp_metadata=tknp_metadata if is_tknp_initialized() else None,
                 ),
             ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-                if is_tknp_initialized() and outputs is None:
-                    # outputs = torch.zeros(input_ids.numel(), self.model_config.get_hidden_size(), dtype=self.model_config.dtype, device=input_ids.device)
-                    _ref = input_ids if input_ids is not None else inputs_embeds
-                    outputs = torch.zeros(_ref.size(0), self.model_config.get_hidden_size(),
-                                        dtype=self.model_config.dtype, device=_ref.device)
+                model = self.model
+                compile_state: list[tuple[nn.Module, bool]] = []
+                if is_profile and is_tknp_initialized():
+                    # KV sizing runs before per-rank cache capacity is known.
+                    # Keep this initialization-only pass from creating a
+                    # balanced Dynamo trace that would later constrain the
+                    # capacity-aware CUDA Graph shard shape.
+                    model = self.get_model()
+                    for module in model.modules():
+                        if hasattr(module, "do_not_compile"):
+                            previous = bool(module.do_not_compile)
+                            compile_state.append((module, previous))
+                            module.do_not_compile = True
+
+                try:
+                    outputs = model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                finally:
+                    for module, previous in compile_state:
+                        module.do_not_compile = previous
+                # On non-root TKNP ranks the model returns a
+                # local-sized tensor.  Replace it with a global-sized
+                # dummy so that logit_indices indexing later does not
+                # go out of bounds.
+                if is_tknp_initialized() and not self.root_rank:
+                    outputs = torch.zeros(
+                        num_tokens_padded,
+                        self.model_config.get_hidden_size(),
+                        dtype=self.model_config.dtype,
+                        device=self.device,
+                    )
                     
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -4836,6 +5315,13 @@ class GPUModelRunner(
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+
+        if is_tknp_initialized() and not self.root_rank:
+            # Non-root TKNP ranks keep only their local token shard during
+            # dummy/profile runs. The full-batch logit indices below are only
+            # meaningful on the root rank, which is also the only rank that
+            # runs the dummy sampler.
+            return hidden_states, hidden_states
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
@@ -5084,6 +5570,10 @@ class GPUModelRunner(
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
             return 0
+
+        # Pre-compute TKNP capacity-based splits before graph capture.
+        if is_tknp_initialized() and get_tknp_world_size() > 1:
+            self._compute_tknp_graph_splits()
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 

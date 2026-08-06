@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A hw_nresearch_snoise
-#SBATCH -N 8
+#SBATCH -N 4
 #SBATCH --ntasks-per-node=1
 #SBATCH -p batch
 #SBATCH -J hw_nresearch_snoise-snoise:tknp-benchmark
@@ -21,7 +21,7 @@ CONTAINER_MOUNTS=/home/sshrestha:/home/sshrestha,/lustre/fsw/hw_nresearch_snoise
 CONTAINER_WORKDIR=/home/sshrestha/workspace/2026/vllm-tknp
 
 # Model configuration
-# MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+
 # MODEL_NAME="meta-llama/Llama-3.3-70B-Instruct"
 # MODEL_NAME="Qwen/Qwen2.5-32B"
 MODEL_NAME="mistralai/Devstral-Small-2-24B-Instruct-2512"
@@ -32,10 +32,14 @@ BATCH_SIZE=64
 SEQ_LENGTH=65536
 DECODE_TOKENS=1000
 
+# Which configurations to run: "all", "1", "2", "3", or comma-separated e.g. "1,2"
+RUN_CONFIG="3"
+
 # Parallelism configuration
 TP_SIZE=8
 TKNP_SIZE=$NODES
 PP_SIZE=$NODES
+DCP_SIZE=1
 
 # GPUs per node
 GPUS_PER_NODE=8
@@ -65,13 +69,15 @@ echo "Decode Tokens: $DECODE_TOKENS"
 echo "TP Size: $TP_SIZE"
 echo "TKNP Size: $TKNP_SIZE"
 echo "PP Size: $PP_SIZE"
+echo "DCP Size: $DCP_SIZE"
 echo "======================================================================"
 echo ""
 
 # Configuration 1: Pipeline Parallel (TP + PP, TKNP=1)
+if [[ "$RUN_CONFIG" == "all" || ",$RUN_CONFIG," == *",1,"* ]]; then
 echo "----------------------------------------------------------------------"
 echo "Configuration 1: Pipeline Parallel"
-echo "TP=$TP_SIZE, PP=$PP_SIZE, TKNP=1"
+echo "TP=$TP_SIZE, PP=$PP_SIZE, TKNP=1, DCP=$DCP_SIZE"
 echo "----------------------------------------------------------------------"
 srun --mpi=pmix \
      --nodes=$NODES \
@@ -90,17 +96,20 @@ srun --mpi=pmix \
           $SEQ_LENGTH \
           $DECODE_TOKENS \
           $NODES \
-          $GPUS_PER_NODE
+          $GPUS_PER_NODE \
+          $DCP_SIZE
 
 echo ""
 echo "✓ Configuration 1 completed"
 echo ""
 sleep 5
+fi
 
 # Configuration 2: Token Parallel (TP + TKNP, PP=1)
+if [[ "$RUN_CONFIG" == "all" || ",$RUN_CONFIG," == *",2,"* ]]; then
 echo "----------------------------------------------------------------------"
 echo "Configuration 2: Token Parallel"
-echo "TP=$TP_SIZE, TKNP=$TKNP_SIZE, PP=1"
+echo "TP=$TP_SIZE, TKNP=$TKNP_SIZE, PP=1, DCP=$DCP_SIZE"
 echo "----------------------------------------------------------------------"
 srun --mpi=pmix \
      --nodes=$NODES \
@@ -119,10 +128,46 @@ srun --mpi=pmix \
           $SEQ_LENGTH \
           $DECODE_TOKENS \
           $NODES \
-          $GPUS_PER_NODE
+          $GPUS_PER_NODE \
+          $DCP_SIZE
 
 echo ""
 echo "✓ Configuration 2 completed"
+echo ""
+sleep 5
+fi
+
+# Configuration 3: Decode Context Parallel (TP across all GPUs, DCP=$NODES)
+if [[ "$RUN_CONFIG" == "all" || ",$RUN_CONFIG," == *",3,"* ]]; then
+DCP_TP_SIZE=$((8 * NODES))
+DCP_SIZE=$NODES
+echo "----------------------------------------------------------------------"
+echo "Configuration 3: Decode Context Parallel"
+echo "TP=$DCP_TP_SIZE, PP=1, TKNP=1, DCP=$NODES"
+echo "----------------------------------------------------------------------"
+srun --mpi=pmix \
+     --nodes=$NODES \
+     --ntasks-per-node=1 \
+     --container-image=$IMAGE \
+     --container-mounts=$CONTAINER_MOUNTS \
+     --container-workdir=$CONTAINER_WORKDIR \
+     --no-container-mount-home \
+     --export=ALL,MASTER_ADDR=$MASTER_ADDR,MASTER_PORT=$MASTER_PORT \
+     bash examples/offline_inference/TKNP/jobs/run_tknp_worker.sh \
+          "$MODEL_NAME" \
+          $DCP_TP_SIZE \
+          1 \
+          1 \
+          $BATCH_SIZE \
+          $SEQ_LENGTH \
+          $DECODE_TOKENS \
+          $NODES \
+          $GPUS_PER_NODE \
+          $DCP_SIZE
+
+echo ""
+echo "✓ Configuration 3 completed"
+fi
 echo ""
 
 # ============================================================================

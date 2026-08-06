@@ -465,6 +465,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # For FA3 + full cudagraph
         if self.use_full_cuda_graph and scheduler_metadata is not None:
             n = scheduler_metadata.shape[0]
+            # The capture schedule may exceed the initially allocated buffer.
+            if n > self.scheduler_metadata.shape[0]:
+                self.scheduler_metadata = torch.zeros(
+                    n, dtype=torch.int32, device=self.device
+                )
             self.scheduler_metadata[:n] = scheduler_metadata
             # NOTE(woosuk): We should zero out the rest of the scheduler
             # metadata to guarantee the correctness. Otherwise, some thread

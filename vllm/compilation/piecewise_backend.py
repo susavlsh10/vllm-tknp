@@ -5,6 +5,7 @@ import dataclasses
 from collections.abc import Callable
 from typing import Any
 
+import torch
 import torch.fx as fx
 
 from vllm.compilation.backends import VllmBackend
@@ -166,7 +167,19 @@ class PiecewiseBackend:
         return None
 
     def __call__(self, *args) -> Any:
-        runtime_shape = args[self.sym_shape_indices[0]]
+        if self.sym_shape_indices:
+            runtime_shape = args[self.sym_shape_indices[0]]
+        else:
+            # No symbolic shape arguments (e.g. a pass-through subgraph on
+            # a non-root token-parallel rank).  Infer the dynamic dimension
+            # from the first tensor argument.
+            runtime_shape = None
+            for arg in args:
+                if isinstance(arg, torch.Tensor) and arg.dim() > 0:
+                    runtime_shape = arg.size(0)
+                    break
+            if runtime_shape is None:
+                runtime_shape = self.compile_sizes[0]
         range_entry = self._find_range_for_shape(runtime_shape)
 
         assert range_entry is not None, (

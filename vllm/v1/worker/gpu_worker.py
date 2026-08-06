@@ -532,10 +532,19 @@ class Worker(WorkerBase):
             )
 
             # We skip EPLB here since we don't want to record dummy metrics
+            fixed_tknp_cudagraph = (
+                os.environ.get("VLLM_TKNP_REQUIRE_CUDAGRAPH", "0") == "1"
+                and self.parallel_config.enable_token_parallel
+                and self.parallel_config.token_parallel_size > 1
+            )
             hidden_states, last_hidden_states = self.model_runner._dummy_run(
                 num_tokens=max_num_reqs,
                 skip_eplb=True,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                # This sampler-buffer initialization can be larger than the
+                # one exact TKNP graph captured by the homogeneous POC. Keep
+                # it uncompiled; it is never part of benchmark measurement.
+                is_profile=fixed_tknp_cudagraph,
             )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)

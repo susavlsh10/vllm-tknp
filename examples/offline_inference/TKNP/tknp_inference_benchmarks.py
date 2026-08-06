@@ -11,6 +11,9 @@ torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_bench
 Pipeline parallelism:
 torchrun --nproc-per-node=8 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --tensor-parallel-size 4 --pipeline-parallel-size 2 --batch-size 32 --seq-length 32768
 
+Context parallelism:
+torchrun --nproc-per-node=4 examples/offline_inference/TKNP/tknp_inference_benchmarks.py --model Qwen/Qwen2.5-1.5B-Instruct --tensor-parallel-size 4 --token-parallel-size 1 --decode-context-parallel-size 2 --batch-size 32 --seq-length 32768
+
 
 Supported models: 
 
@@ -66,6 +69,15 @@ def parse_args():
     # batch size and seq length for prompts
     parser.add_argument("--batch-size", type=int, default=8,
                         help="Batch size for prompts (default: 8)")
+    parser.add_argument(
+        "--batch-size-sequence",
+        type=int,
+        nargs="+",
+        help=(
+            "Run several batch sizes sequentially in one initialized engine. "
+            "Used to validate CUDA Graph variant switching."
+        ),
+    )
     parser.add_argument("--seq-length", type=int, default=128,
                         help="Sequence length for prompts (default: 128)")
     parser.add_argument("--print-outputs", action="store_true",
@@ -81,7 +93,14 @@ def parse_args():
                         help="Skip prefill by pre-filling KV cache with dummy values (for decode-only benchmarking)")
     parser.add_argument("--load-format", type=str, default="dummy",
                         help="Weight loading format. Use 'dummy' for random weights (default, faster for benchmarking) or 'auto' for real weights")
-
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="Enable CUDA Graph execution (default: eager mode)")
+    parser.add_argument("--cudagraph-capture-sizes", type=int, nargs="+",
+                        help="CUDA Graph capture sizes (useful for bounded smoke tests)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="Fraction of GPU memory available to vLLM (default: 0.9)")
+    parser.add_argument("--decode-context-parallel-size", type=int, default=1,
+                        help="Number of context parallel processes for decoding (default: 1)")
     return parser.parse_args()
 
 def get_gpu_name():
@@ -129,8 +148,9 @@ def save_benchmark_results(args, metrics, output_dir):
     tp_size = args.tensor_parallel_size
     pp_size = args.pipeline_parallel_size
     tknp_size = args.token_parallel_size
+    dcp_size = args.decode_context_parallel_size
     
-    filename = f"{model_name}_{gpu_name}_TP_{tp_size}_PP_{pp_size}_TKNP_{tknp_size}.csv"
+    filename = f"{model_name}_{gpu_name}_TP_{tp_size}_PP_{pp_size}_TKNP_{tknp_size}_DCP_{dcp_size}.csv"
     filepath = os.path.join(output_dir, filename)
     
     # Check if file exists to determine if we need to write headers
@@ -282,9 +302,8 @@ def inference_benchmark(llm, prompts, args):
     so we only measure pure decode latency and throughput.
     
     This uses a two-stage measurement approach:
-    1. Warmup run with 10 tokens to measure initialization overhead
-    2. Main run with args.decode_tokens + 10 tokens
-    3. Actual decode time = main_time - warmup_time (subtracts overhead)
+    1. An unmeasured warmup run with 10 tokens
+    2. A timed run with exactly ``args.decode_tokens`` tokens
     """
     
     if dist.get_rank() == 0:
@@ -321,12 +340,14 @@ def inference_benchmark(llm, prompts, args):
     if dist.get_rank() == 0:
         print(f"Warmup time: {warmup_time_ms:.2f} ms\n")
 
-    # ===== Stage 2: Main Benchmark Run (decode_tokens + 10) =====
+    # ===== Stage 2: Timed Benchmark Run =====
     if dist.get_rank() == 0:
-        print(f"Stage 2: Running main benchmark with {args.decode_tokens + warmup_tokens} tokens...")
+        print(f"Stage 2: Running main benchmark with {args.decode_tokens} tokens...")
     
     decode_tokens = args.decode_tokens
-    main_sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=decode_tokens + warmup_tokens)
+    main_sampling_params = SamplingParams(
+        temperature=0, top_p=1.0, max_tokens=decode_tokens
+    )
     
     main_start = torch.cuda.Event(enable_timing=True)
     main_end = torch.cuda.Event(enable_timing=True)
@@ -341,8 +362,11 @@ def inference_benchmark(llm, prompts, args):
     
     main_time_ms = main_start.elapsed_time(main_end)
     
-    # ===== Stage 3: Calculate Actual Decode Time =====
-    actual_decode_time_ms = main_time_ms - warmup_time_ms
+    # The warmup is intentionally excluded from the timed region.  Subtracting
+    # a separate warmup duration is invalid because the two runs can have
+    # different scheduling and initialization costs (and can yield negative
+    # measured time for short smokes).
+    actual_decode_time_ms = main_time_ms
     total_decode_tokens = args.batch_size * decode_tokens
     
     # Calculate metrics using actual decode time
@@ -388,6 +412,18 @@ def inference_benchmark(llm, prompts, args):
 
 def setup_vllm_model(args):
     """Setup the LLM with given parallelism configurations."""
+
+    if args.cuda_graph and args.token_parallel_size >= 2:
+        # Homogeneous-request POC: use one fixed lifetime estimate when
+        # selecting both the capacity-aware scheduler split and graph shape.
+        request_tokens = args.seq_length + max(args.decode_tokens, 10)
+        os.environ["VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS"] = str(request_tokens)
+        os.environ["VLLM_TKNP_REQUIRE_CUDAGRAPH"] = "1"
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "TKNP CUDA Graph fail-closed mode: "
+                f"request_tokens={request_tokens}; eager fallback disabled"
+            )
     
     # Use `distributed_executor_backend="external_launcher"` so that
     # this llm engine/instance only creates one worker.
@@ -404,14 +440,17 @@ def setup_vllm_model(args):
         "data_parallel_size": args.data_parallel_size,
         "distributed_executor_backend": "external_launcher",
         "seed": args.seed,
-        "enforce_eager": True,
+        "enforce_eager": not args.cuda_graph,
         "enable_prefix_caching": False,  # Disable prefix caching for benchmarking
-        "gpu_memory_utilization": 0.9,  # Max GPU memory utilization
-        "max_num_batched_tokens": 32768,  # max number of tokens in a single forward pass
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_num_batched_tokens": 1024 if args.skip_prefill else 32768,  # max number of tokens in a single forward pass
         "load_format": args.load_format,  # Weight loading format
         # "attention_config": AttentionConfig(backend="FLASHINFER"),# FLASH_ATTN, FLASHINFER
         # "max_model_len": 32768,
     }
+
+    if args.cudagraph_capture_sizes:
+        llm_kwargs["cudagraph_capture_sizes"] = args.cudagraph_capture_sizes
     
     # Only add token parallel configs if token parallelism is enabled
     if args.token_parallel_size >= 2:
@@ -429,6 +468,10 @@ def setup_vllm_model(args):
                 "fill_std": 0.0,     # 0 = constant, >0 = random sampling
             }
         )
+
+    # decode context parallel
+    if args.decode_context_parallel_size > 1:
+        llm_kwargs["decode_context_parallel_size"] = args.decode_context_parallel_size
 
     llm = LLM(**llm_kwargs)
     if dist.get_rank() == 0:
@@ -472,6 +515,7 @@ def run_inference_benchmark(args, llm, batch_size, seq_length):
     except Exception as e:
         if dist.get_rank() == 0:
             print(f"Error during inference benchmark: {e}")
+        raise
 
 
 def get_kv_cache_info(llm):
@@ -644,7 +688,7 @@ def run_data_collection(args, llm):
         # 128: [16384, 32768, 65536],
         # 256: [16384, 32768],
 
-        # B200 configs for Llama 8b
+        # configs
         32: [32768, 65536, 98304, 114688],
         64: [32768, 65536, 98304, 114688],
         128: [16384, 32768, 65536, 98304],
@@ -722,9 +766,46 @@ def run_data_collection(args, llm):
 def main():
     args = parse_args()
 
+    if args.batch_size_sequence:
+        if not args.cuda_graph:
+            raise ValueError(
+                "--batch-size-sequence is a CUDA Graph validation mode; "
+                "eager execution is not allowed"
+            )
+        capture_sizes = set(args.cudagraph_capture_sizes or [])
+        missing_sizes = sorted(set(args.batch_size_sequence) - capture_sizes)
+        if missing_sizes:
+            raise ValueError(
+                "Every --batch-size-sequence value must have an explicit "
+                "CUDA Graph capture; missing sizes: " + str(missing_sizes)
+            )
+
     llm = setup_vllm_model(args)
 
-    if not args.collect_data:
+    if args.batch_size_sequence:
+        kv_cache_info = get_kv_cache_info(llm)
+        for batch_size in args.batch_size_sequence:
+            fits, _, _ = check_workload_fits(
+                kv_cache_info,
+                batch_size,
+                args.seq_length,
+                args.decode_tokens,
+                verbose=True,
+            )
+            if not fits:
+                raise RuntimeError(
+                    f"Batch size {batch_size} exceeds TKNP KV capacity"
+                )
+            if dist.get_rank() == 0:
+                print(f"TKNP_BATCH_VARIANT_START batch_size={batch_size}")
+            run_inference_benchmark(
+                args, llm, batch_size, args.seq_length
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+            if dist.get_rank() == 0:
+                print(f"TKNP_BATCH_VARIANT_PASS batch_size={batch_size}")
+    elif not args.collect_data:
         # For single run, get KV cache info and check with verbose output
         kv_cache_info = get_kv_cache_info(llm)
         fits, _, _ = check_workload_fits(

@@ -1,114 +1,167 @@
-# Token Parallelism for Massive Cluster Scale LLM Inference
+# Token Parallel Inference Benchmarks
 
-## Motivation
-
-Profiling large-scale LLM inference workloads reveals that **attention becomes the dominant bottleneck during the decode stage**, especially under large batch sizes and long sequence lengths. Unlike the prefill stage, decoding requires heavy memory I/O due to **KV cache**, where each request maintains its own unique cache. This leads to:
-
-- Increased memory pressure
-- Higher I/O requirements for KV cache lookups and writes
-- Limited scalability with standard tensor and data parallel setups
-
-**Key insight:**  
-MLP layers are relatively compute-bound and scale well under existing tensor parallel systems, but **attention layers require additional memory and I/O scaling**. Our solution is to allocate more GPUs specifically for attention to increase compute, memory, and bandwidth capacity **only for attention**, while keeping the MLP layers lightweight.
-
-Current Multi-node architectures: Use Tensor Parallel within a node inside the NVLink domain and use pipeline parallel across nodes to shard the model weights across GPUs. The problem with this system is that adding more GPUs to the pipeline does not make inference faster or more efficient as it only adds pipeline stages. The latecy/request does not imporve by adding more resources. 
-
-This document outlines the implementation plan for a new parallelism architecture to accelerate LLM inference on distributed multi-node multi-GPU systems. The primary goal is to improve latency, throughput and memory efficiency during large batch, long-sequence decoding.
+This directory contains benchmarking scripts for measuring **decode performance** in vLLM with support for Token Parallelism (TKNP), Tensor Parallelism (TP), Pipeline Parallelism (PP), and Decode Context Parallelism (DCP).
 
 ---
 
-## Proposed Architecture: Token Parallelism (TKNP)
+## Overview
 
-**Token Parallel** is a new parallelism architecture designed for accelerating inference workloads with massive batch sizes and sequence lengths. The key idea is to allocate more GPU (compute, memory) for attention as we scale the number of nodes and GPUs. TKNP is compatible with tensor (TP), pipeline (PP), and expert (EP) parallel techniques. 
-
-### Key Design Principles
-
-1. **Attention computation and KV cache is sharded across more GPUs** than MLP layers to handle KV cache bottlenecks.
-2. **MLP layers and attention projections (QKV, output projection)** are processed by the **root rank** in each token parallel group.
-3. Other ranks in the token parallel group **do not hold model weights**, instead they allocate their memory to cache and process attention computation on their respective KV partitions.
+The benchmark script [`tknp_inference_benchmarks.py`](tknp_inference_benchmarks.py) measures **pure decode throughput and latency** — the time to generate new tokens after the KV cache has been pre-filled. Prefill is intentionally skipped by using the `DecodeBenchConnector`, which fills the KV cache with dummy constant values. This isolates decode performance from prefill costs.
 
 ---
 
-## Implementation Details
+## Prerequisites
 
-### Process Group Setup : vllm/distributed/parallel_state.py
-
-- The system initializes **tensor parallel** and **pipeline parallel** groups as usual.
-- An additional **token parallel process group** is created.
-- **No model replication** is performed in token parallel attention GPUs. Only the root rank in the TKNP group holds the model weights.
-- The TKNP group creation has already been added in the parallel_states.py.
-
-### Computation Flow
-
-+ **Projections, MLP, LayerNorms, standard layers on Root Nodes**
-Root node(s) store model weights and compute QKV projections and MLP layers. This is efficient, as profiling shows these layers scale well with tensor parallelism alone.
-
-+ **Token Parallel Attention Across Nodes**
-After the QKV projection in the root node(s), the outputs are scattered across token-parallel GPUs (along the batch dimension).
-Each GPU holds a unique shard of the KV cache (batch and KV head dimension) and computes attention independently for its batch/requests.
-Attention outputs are gathered back to the root node(s) for the output projection and continuation of decoding.
-
-## Architecture details
-
-Token Parallel can be used together with Tensor and Pipeline Parallel. Within a node and inside the NVLink domain, we will set up a tensor parallel group (usually 8 GPUs). If the model weights do not fit within a single node, we will use pipeline parallel across multiple nodes and build the pipeline parallel group. The nodes with model weights are responsible for all projection, feedforward, layer norm layers. We will have exactly 1 replica of the model weights. The node(s) with the model weights are our root node(s). 
-
-Any additional node(s) or GPU(s) added to the system will be in the Token Parallel dimension. These node(s) will only store the KV cache and compute the workload for attention. The attention nodes work together with the root node for each forward pass. 
-
-When tensor parallel is enabled, the token parallel group works as follows. (Assumes each node has 8 GPUs)
-+ Each node will have the same number of GPUs in a tensor parallel setup 
-    For example, if we use a TP = 8 in the root node, the same TP groups are created in all the attention nodes. 
-
-+ The token parallel group consists of GPUs with the same tensor parallel rank in each node.
-    For example, if we use a TP = 8 with 2 nodes, GPU 0, 8 will form a TKNP group. 
-                             TP = 8 with 3 nodes, GPU 0, 8, 16 will form a TKNP group. 
-
-+ In each token parallel group, only the root rank (index 0 of each group), will store model weights
-    The root rank(s) do all the computation for all the layers except attention. 
-
-
-Example of Tensor and Token Parallel with 2 node system
-```
---------------------------------------------------------------------------------
-Node 1 : | GPU 8 = GPU 9 = GPU 10 = GPU 11 = GPU 12 = GPU 13 = GPU 14 = GPU 15 |
---------------------------------------------------------------------------------
-             ||     ||       ||       ||       ||       ||        ||       ||         
---------------------------------------------------------------------------------
-Node 0 : | GPU 0 = GPU 1 = GPU 2  = GPU 3  = GPU 4  = GPU 5  = GPU 6  = GPU 7 |
---------------------------------------------------------------------------------
-
-Legend :
-=  : Tensor Parallel
-|| : Token Parallel
-```
----
-
-## Example forward pass 
-
-A sample forward pass would look something like this in the prefill stage. 
-
-The entire forward pass in the prefill stage will be computed in the root node(s). After each layer is computed, the KV cache of a subset of requests will be transfered to the token parallel attention nodes and GPUs. We need to have this here for compatibility. Ideally, token parallel inference is only used during the decode stage. 
-
-A sample forward pass would look something like this in the decode stage. 
-
-In the attention layer, we would already have the KV cache populated from the prefill stage or have the KV cache transfered from a different server. 
-The input to the attention layer would be a tensor of shape input_attention = [batch_size, hidden_dim]. The root rank(s) compute the QKV projection out_qkv_proj = [batch_size, qkv_proj_dim]. At this stage, we scatter the requests in the batch dimension to the token parallel groups. If we have a token parallel size = TKNP_size, each GPU in the token parallel group will receive a tensor of shape [batch_size // TKNP_size, qkv_proj_dim]. Ideally, we would have a way to configure the number of requests processed by the root node and the number of requests scattered to the attention nodes. Since the root node has lower amount of free GPU memory available compared to the attention node, it should have a lower space available for its KV cache -> requires smaller local batch size. 
-
+- vLLM installed from this repository
+- Access to the target model (Hugging Face hub or local path), or use `--load-format dummy` for random weights
 
 ---
 
+## Running the Benchmarks
 
-## End to end generation 
+All commands must be launched with `torchrun`.
+
+### Token Parallelism (TKNP)
+
+Distributes the **KV cache and decode steps** across GPUs, keeping weights replicated. Each GPU holds a contiguous slice of the sequence's KV cache.
 
 ```bash
-# 2 GPUs with tensor parallel
-torchrun --nproc-per-node=2 TKNP/test_torchrun.py --tensor-parallel-size 2
-
-# 2 GPUs with token parallel enabled
-torchrun --nproc-per-node=2 TKNP/test_torchrun.py --tensor-parallel-size 1 --enable-token-parallel --token-parallel-size 2
+torchrun --nproc-per-node=4 \
+    examples/offline_inference/TKNP/tknp_inference_benchmarks.py \
+    --tensor-parallel-size 1 \
+    --token-parallel-size 4 \
+    --batch-size 32 \
+    --seq-length 32768
 ```
 
-#### Debug script 
+### Tensor Parallelism (TP)
+
+Distributes **model weights** (attention heads and FFN layers) across GPUs.
 
 ```bash
-torchrun --nproc-per-node=2 TKNP/test_torchrun.py --tensor-parallel-size 1 --enable-token-parallel --token-parallel-size 2 > tknp_out.txt 2>&1
+torchrun --nproc-per-node=8 \
+    examples/offline_inference/TKNP/tknp_inference_benchmarks.py \
+    --tensor-parallel-size 8 \
+    --token-parallel-size 1 \
+    --batch-size 32 \
+    --seq-length 16384
+```
+
+### Pipeline Parallelism (PP)
+
+Distributes **model layers** across GPUs in a pipeline.
+
+```bash
+torchrun --nproc-per-node=8 \
+    examples/offline_inference/TKNP/tknp_inference_benchmarks.py \
+    --tensor-parallel-size 4 \
+    --pipeline-parallel-size 2 \
+    --batch-size 32 \
+    --seq-length 32768
+```
+
+### Decode Context Parallelism (DCP)
+
+Splits the **KV cache attention computation** across GPUs during the decode step (ring attention).
+
+```bash
+torchrun --nproc-per-node=4 \
+    examples/offline_inference/TKNP/tknp_inference_benchmarks.py \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --tensor-parallel-size 4 \
+    --token-parallel-size 1 \
+    --decode-context-parallel-size 2 \
+    --batch-size 32 \
+    --seq-length 32768
+```
+
+### Combined: TP + TKNP
+
+```bash
+torchrun --nproc-per-node=8 \
+    examples/offline_inference/TKNP/tknp_inference_benchmarks.py \
+    --tensor-parallel-size 2 \
+    --token-parallel-size 4 \
+    --batch-size 64 \
+    --seq-length 65536
+```
+
+---
+
+## Systematic Data Collection
+
+Use `--collect-data` to sweep over a set of predefined batch sizes and sequence lengths automatically. Configurations that exceed KV cache capacity are skipped.
+
+```bash
+torchrun --nproc-per-node=4 \
+    examples/offline_inference/TKNP/tknp_inference_benchmarks.py \
+    --tensor-parallel-size 1 \
+    --token-parallel-size 4 \
+    --collect-data \
+    --output-dir examples/offline_inference/TKNP/tknp_data
+```
+
+The default sweep covers:
+
+| Batch Size | Sequence Lengths |
+|---|---|
+| 32 | 32768, 65536, 98304, 114688 |
+| 64 | 32768, 65536, 98304, 114688 |
+| 128 | 16384, 32768, 65536, 98304 |
+| 256 | 16384, 32768, 65536, 98304 |
+| 512 | 16384, 32768 |
+
+To customize the sweep, edit the `batch_seq_configs` dictionary in `run_data_collection()`.
+
+---
+
+## Command Line Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--tensor-parallel-size` | `1` | Number of tensor parallel GPUs |
+| `--pipeline-parallel-size` | `1` | Number of pipeline stages |
+| `--data-parallel-size` | `1` | Number of data parallel replicas |
+| `--token-parallel-size` | `1` | Number of token parallel GPUs (TKNP) |
+| `--decode-context-parallel-size` | `1` | Number of context parallel GPUs for decode |
+| `--model` | `meta-llama/Llama-3.1-8B-Instruct` | Hugging Face model ID or local path |
+| `--batch-size` | `8` | Number of concurrent requests |
+| `--seq-length` | `128` | Prompt length in tokens |
+| `--decode-tokens` | `1000` | Number of tokens to decode per request |
+| `--load-format` | `dummy` | Weight loading format: `dummy` (random, fast) or `auto` (real weights) |
+| `--skip-prefill` | `True` | Pre-fill KV cache with dummy values to benchmark decode-only |
+| `--collect-data` | off | Run the full batch × seq_length sweep |
+| `--output-dir` | `examples/offline_inference/TKNP/tknp_data` | Directory for CSV result files |
+| `--print-outputs` | off | Print generated text (rank 0 only) |
+| `--seed` | `1` | Random seed for reproducibility |
+
+> **Note:** `--load-format dummy` uses randomly initialized weights and is the recommended default for benchmarking. Use `--load-format auto` to load real model weights.
+
+---
+
+## Supported Models
+
+| Family | Models |
+|---|---|
+| **Llama 3** | `meta-llama/Llama-3.2-1B-Instruct`, `meta-llama/Llama-3.2-3B-Instruct`, `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.3-70B-Instruct` |
+| **Qwen** | `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-32B`, `Qwen/Qwen2.5-32B`, `Qwen/Qwen2.5-72B-Instruct` |
+| **Mistral / Ministral** | `ministral/Ministral-3b-instruct`, `mistralai/Devstral-Small-2-24B-Instruct-2512`, `mistralai/Mistral-Large-Instruct-557161` |
+
+---
+
+## Output Format
+
+Results are appended to a CSV file in `--output-dir`. The filename encodes the configuration:
+
+```
+{ModelName}_{GPU}_{TP}_{PP}_{TKNP}_{DCP}.csv
+```
+
+Example: `Llama-3.1-8B_H100_TP_1_PP_1_TKNP_4_DCP_1.csv`
+
+Each row contains:
+
+```
+batch_size, seq_length, decode_time_ms, decode_tokens, sys_decode_tps,
+decode_tps_per_gpu, avg_decode_latency_ms, decode_tps_per_user
 ```

@@ -441,8 +441,10 @@ def _support_torch_compile(
             )
             return TorchCompileWithNoGuardsWrapper.__call__(self, *args, **kwargs)
 
-        # This is the path for the first compilation.
-        # the first compilation needs to have dynamic shapes marked
+        # Keep model input dimensions symbolic. TKNP CUDA Graph variants can
+        # have different capacity-aware local shard sizes even when they are
+        # captured by the same process. Communication sizes remain concrete
+        # inside each individual CUDA Graph capture.
         _mark_dynamic_inputs(
             self,
             ds_type,

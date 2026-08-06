@@ -24,6 +24,74 @@ forward_start_time: float = 0
 batchsize_logging_interval: float = envs.VLLM_LOG_BATCHSIZE_INTERVAL
 batchsize_forward_time: defaultdict = defaultdict(list)
 
+
+def compute_capacity_aware_tknp_split(
+    num_requests: int,
+    blocks_per_request: int,
+    free_blocks_per_rank: list[int],
+) -> list[int]:
+    """Return the deterministic contiguous TKNP request split.
+
+    This is shared by the scheduler and CUDA Graph capture so a graph's
+    rank-local tensor shapes exactly match the runtime request assignment.
+    Rank 0 is capped at the even share (and at its smaller KV capacity),
+    while any remainder is distributed over non-root ranks first.
+    """
+    if num_requests < 0:
+        raise ValueError(f"num_requests must be non-negative, got {num_requests}")
+    if blocks_per_request <= 0:
+        raise ValueError(
+            f"blocks_per_request must be positive, got {blocks_per_request}"
+        )
+    if not free_blocks_per_rank:
+        raise ValueError("free_blocks_per_rank must not be empty")
+
+    world_size = len(free_blocks_per_rank)
+    capacities = [
+        max(0, int(free_blocks) // blocks_per_request)
+        for free_blocks in free_blocks_per_rank
+    ]
+    if world_size == 1:
+        if capacities[0] < num_requests:
+            raise RuntimeError(
+                f"TKNP KV capacity is insufficient for {num_requests} requests: "
+                f"capacity={capacities}"
+            )
+        return [num_requests]
+
+    root_count = min(num_requests // world_size, capacities[0])
+    remaining = num_requests - root_count
+    non_root_base, non_root_remainder = divmod(remaining, world_size - 1)
+
+    counts = [root_count]
+    for rank in range(1, world_size):
+        target = non_root_base + (1 if rank <= non_root_remainder else 0)
+        counts.append(min(target, capacities[rank]))
+
+    shortfall = num_requests - sum(counts)
+    if shortfall > 0:
+        for rank in range(1, world_size):
+            room = capacities[rank] - counts[rank]
+            give = min(room, shortfall)
+            counts[rank] += give
+            shortfall -= give
+            if shortfall == 0:
+                break
+
+    if shortfall > 0:
+        room = capacities[0] - counts[0]
+        give = min(room, shortfall)
+        counts[0] += give
+        shortfall -= give
+
+    if shortfall > 0:
+        raise RuntimeError(
+            f"TKNP KV capacity is insufficient for {num_requests} requests: "
+            f"assigned={counts}, capacity={capacities}, "
+            f"unassigned={shortfall}"
+        )
+    return counts
+
 @dataclass
 class TokenParallelMetadata:
     """Metadata for layers using Token Parallelism."""
@@ -45,6 +113,11 @@ class TokenParallelMetadata:
     local_num_tokens: Optional[int] = None
     root_rank: int = 0
     _dummy_run: bool = False
+    is_cuda_graph: bool = False
+    # Tensor whose trailing dimension is the local TKNP token count. During
+    # torch.compile this supplies a symbolic local-shard size to TKNP layers,
+    # allowing one process to compile several CUDA Graph batch/split variants.
+    _compile_local_shape_source: Optional[torch.Tensor] = None
 
 
 class BatchDescriptor(NamedTuple):

@@ -330,6 +330,8 @@ class EngineCore:
             # interested in dumping info when the exception is due to an
             # error from execute_model itself.
 
+            logger.exception("Model execution failed before scheduler dump")
+
             # NOTE: This method is exception-free
             dump_engine_exception(
                 self.vllm_config, scheduler_output, self.scheduler.make_stats()
