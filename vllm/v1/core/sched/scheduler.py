@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import os
 import time
 from collections import defaultdict
@@ -25,7 +26,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.forward_context import compute_capacity_aware_tknp_split
+from vllm.forward_context import (
+    build_tknp_dbo_cohort_rank_order,
+    compute_capacity_aware_tknp_split,
+    compute_dbo_tknp_split,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -424,8 +429,13 @@ class TokenParallelScheduler:
                 use_capacity_aware = False
 
         if use_capacity_aware:
+            split_fn = (
+                compute_dbo_tknp_split
+                if self.parallel_config.enable_dbo
+                else compute_capacity_aware_tknp_split
+            )
             assigned_counts = np.asarray(
-                compute_capacity_aware_tknp_split(
+                split_fn(
                     num_requests=num_unassigned,
                     blocks_per_request=blocks_per_req,
                     free_blocks_per_rank=free.tolist(),
@@ -438,21 +448,53 @@ class TokenParallelScheduler:
         # Fallback: no capacity info — equal distribution.
         # ------------------------------------------------------------------
         if not use_capacity_aware:
-            base = num_unassigned // self.tknp_world_size
-            remainder = num_unassigned % self.tknp_world_size
-            assigned_counts = np.full(self.tknp_world_size, base,
-                                      dtype=np.int32)
-            for r in range(remainder):
-                target = (r + 1) % self.tknp_world_size
-                assigned_counts[target] += 1
+            if self.parallel_config.enable_dbo:
+                assigned_counts = np.asarray(
+                    compute_dbo_tknp_split(
+                        num_requests=num_unassigned,
+                        blocks_per_request=1,
+                        free_blocks_per_rank=[num_unassigned]
+                        * self.tknp_world_size,
+                    ),
+                    dtype=np.int32,
+                )
+            else:
+                base = num_unassigned // self.tknp_world_size
+                remainder = num_unassigned % self.tknp_world_size
+                assigned_counts = np.full(self.tknp_world_size, base,
+                                          dtype=np.int32)
+                for r in range(remainder):
+                    target = (r + 1) % self.tknp_world_size
+                    assigned_counts[target] += 1
 
         # Sanity: sum of target counts must match number of unassigned.
         assert int(assigned_counts.sum()) == num_unassigned, \
             f"assigned_counts sum={assigned_counts.sum()} != num_unassigned={num_unassigned}"
 
         # ------------------------------------------------------------------
-        # 3) Block-wise assignment in waiting order.
+        # 3) Assignment in waiting order.
         # ------------------------------------------------------------------
+        if self.parallel_config.enable_dbo:
+            # Fixed two-cohort TKNP prototype: retain the capacity-aware total
+            # assigned to each rank, but ensure both contiguous half-batches
+            # contain work for every rank. This lets UBatchWrapper use cheap
+            # tensor slices while keeping both cohorts balanced.
+            rank_order = build_tknp_dbo_cohort_rank_order(
+                assigned_counts.tolist()
+            )
+            for idx, assigned_rank in zip(unassigned_indices, rank_order):
+                self._assign_request_to_rank(waiting_list[idx], assigned_rank)
+
+            if self.world_rank == 0:
+                logger.info(
+                    "TKNP_UBATCH_ASSIGNMENT cohort_sizes=(%d,%d) counts=%s",
+                    num_unassigned // 2,
+                    num_unassigned - num_unassigned // 2,
+                    assigned_counts.tolist(),
+                )
+                self.print_debug_info()
+            return
+
         current_rank = 0
         used_for_rank = 0
 
@@ -724,6 +766,20 @@ class Scheduler(SchedulerInterface):
         """
         # local free blocks on *this* rank
         local_free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        if os.environ.get("VLLM_TKNP_PLACEMENT_POLICY", "legacy") != "legacy":
+            # Free physical blocks also include the future growth of live
+            # requests. Exclude that growth before admitting another request.
+            future_growth = 0
+            for req_id, owner in self.token_parallel_scheduler.req_to_tknp_rank.items():
+                if owner != get_tknp_rank() or req_id not in self.requests:
+                    continue
+                req = self.requests[req_id]
+                needed = math.ceil((req.num_prompt_tokens + req.max_tokens) /
+                                   self.cache_config.block_size)
+                groups = self.kv_cache_manager.get_block_ids(req_id)
+                allocated = len(groups[0]) if groups else 0
+                future_growth += max(0, needed - allocated)
+            local_free = max(0, local_free - future_growth)
         world_size = get_tknp_world_size()
 
         # all_gather into a tensor (CUDA or CPU; must be same device on all ranks)
@@ -1006,16 +1062,49 @@ class Scheduler(SchedulerInterface):
             if is_tknp_initialized():
                 # self.token_parallel_scheduler.assign_ranks(self.waiting)
                 free_blocks_per_rank = self._gather_tknp_free_blocks()
-                self.token_parallel_scheduler.assign_ranks(
-                    self.waiting,
-                    free_blocks_per_rank=free_blocks_per_rank,
-                )
+                placement_policy = os.environ.get("VLLM_TKNP_PLACEMENT_POLICY", "legacy")
+                if placement_policy == "legacy":
+                    self.token_parallel_scheduler.assign_ranks(
+                        self.waiting,
+                        free_blocks_per_rank=free_blocks_per_rank,
+                    )
+                else:
+                    from vllm.v1.core.sched.tknp_placement import PlacementRequest, place_fifo
+                    planner = self.token_parallel_scheduler
+                    loads = [0] * get_tknp_world_size()
+                    for req_id, owner in planner.req_to_tknp_rank.items():
+                        req = self.requests[req_id]
+                        tokens = req.num_prompt_tokens + req.max_tokens
+                        loads[owner] += (1 if placement_policy == "count" else
+                                         math.ceil(tokens / self.cache_config.block_size)
+                                         if placement_policy == "memory" else tokens)
+                    unassigned = [req for req in self.waiting
+                                  if req.request_id not in planner.req_to_tknp_rank]
+                    assignments = place_fifo(
+                        [PlacementRequest(req.request_id, req.num_prompt_tokens,
+                                          req.max_tokens) for req in unassigned],
+                        free_blocks_per_rank, self.cache_config.block_size,
+                        loads, placement_policy,
+                        request_limits=([max(0, limit - int(planner.tknp_reqs_per_rank[rank]))
+                                         for rank, limit in enumerate(json.loads(os.environ["VLLM_TKNP_GRAPH_SLOT_LIMITS"]))]
+                                        if os.environ.get("VLLM_TKNP_GRAPH_SLOTS") else None),
+                    )
+                    for req in unassigned:
+                        if req.request_id in assignments:
+                            planner._assign_request_to_rank(req, assignments[req.request_id])
 
+            native_lifetime_blocked = False
             while self.waiting and token_budget > 0:
                 
                 if len(self.running) == self.max_num_running_reqs:
                     break
                 request = self.waiting.peek_request()
+                if (is_tknp_initialized()
+                    and os.environ.get("VLLM_TKNP_PLACEMENT_POLICY", "legacy") != "legacy"
+                    and request.request_id not in self.token_parallel_scheduler.req_to_tknp_rank):
+                    # Strict FIFO capacity queue. An unassigned request is not
+                    # a zero-KV runnable request on every rank.
+                    break
 
                 # TKNP: Check rank assignment
                 tknp_skip_caching = False
@@ -1024,6 +1113,16 @@ class Scheduler(SchedulerInterface):
                     
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    wave_size = int(os.environ.get("VLLM_TKNP_KV_WAVE_SIZE", "0"))
+                    if wave_size and is_tknp_initialized():
+                        remote_wave = [req for req in self.waiting
+                                       if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS]
+                        if any(req.request_id not in self.finished_recving_kv_req_ids
+                               for req in remote_wave):
+                            # Fixed-shape integration gate: partial arrival of
+                            # KV must not run a smaller, incompatible graph.
+                            # This mode is explicitly NOT continuous batching.
+                            break
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
                         request.status = RequestStatus.WAITING
@@ -1061,6 +1160,42 @@ class Scheduler(SchedulerInterface):
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
+
+                # Opt-in research admission for ordinary P/D baselines. Native
+                # max_num_seqs excludes WAITING_FOR_REMOTE_KVS, whose blocks
+                # already consume memory. Reserve their future growth too,
+                # matching TKNP's lifetime-aware admission rather than allowing
+                # later preemption/recomputation to masquerade as queueing.
+                if (not is_tknp_initialized()
+                    and os.environ.get("VLLM_TKNP_LIFETIME_ADMISSION") == "1"
+                    and request.num_computed_tokens == 0
+                    and not any(self.kv_cache_manager.get_block_ids(request.request_id))):
+                    if native_lifetime_blocked:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+                    from vllm.v1.core.sched.tknp_placement import unreserved_lifetime_blocks
+                    if len(self.kv_cache_config.kv_cache_groups) != 1:
+                        raise RuntimeError("Lifetime admission currently supports one KV cache group")
+                    live = []
+                    for req_id, req in self.requests.items():
+                        if req.is_finished():
+                            continue
+                        groups = self.kv_cache_manager.get_block_ids(req_id)
+                        allocated = len(groups[0]) if groups else 0
+                        live.append((req.num_prompt_tokens, req.max_tokens, allocated))
+                    free = unreserved_lifetime_blocks(
+                        self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                        self.cache_config.block_size, live)
+                    needed = math.ceil((request.num_prompt_tokens + request.max_tokens) /
+                                       self.cache_config.block_size)
+                    if needed > free:
+                        native_lifetime_blocked = True
+                        # Keep FIFO among new admissions, but continue scanning
+                        # so already-admitted remote receives can become runnable.
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
@@ -2198,6 +2333,13 @@ class Scheduler(SchedulerInterface):
             # Now that the blocks are ready, actually cache them.
             (block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
             num_computed_tokens = len(block_ids) * self.block_size
+            if (is_tknp_initialized()
+                    and not self.token_parallel_scheduler.is_current_rank_assigned(request)):
+                # Nonowners intentionally have no physical blocks. They must
+                # nevertheless advance the *logical* remote-prefill progress,
+                # or replicated schedulers issue different token counts and
+                # deadlock the next QKV scatter/gather.
+                num_computed_tokens = request.num_external_computed_tokens
             # Handle the case where num request tokens less than one block.
             num_computed_tokens = min(num_computed_tokens, request.num_tokens)
             if num_computed_tokens == request.num_tokens:

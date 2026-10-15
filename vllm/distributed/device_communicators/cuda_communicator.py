@@ -124,6 +124,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
     def all_reduce(self, input_):
+        cohort_comms = getattr(self, "tknp_dbo_tp_comms", None)
+        if cohort_comms is not None:
+            from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
+
+            if dbo_enabled():
+                cohort = dbo_current_ubatch_id()
+                symm_comms = getattr(self, "tknp_dbo_tp_symm_comms", None)
+                if symm_comms is not None:
+                    symm_comm = symm_comms[cohort]
+                    if symm_comm.should_use_symm_mem(input_):
+                        out = symm_comm.all_reduce(input_)
+                        if out is None:
+                            raise RuntimeError("TKNP cohort symmetric TP reduction failed")
+                        return out
+                # Unsupported symmetric shapes use private NCCL contexts, not
+                # shared all-reduce scratch or a single ordered context.
+                out = cohort_comms[cohort].all_reduce(input_)
+                if out is None:
+                    raise RuntimeError("TKNP cohort TP all-reduce is unavailable")
+                return out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(

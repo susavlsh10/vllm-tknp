@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+import os
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,7 +18,6 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 
 logger = init_logger(__name__)
-
 track_batchsize: bool = envs.VLLM_LOG_BATCHSIZE_INTERVAL >= 0
 last_logging_time: float = 0
 forward_start_time: float = 0
@@ -91,6 +91,235 @@ def compute_capacity_aware_tknp_split(
             f"unassigned={shortfall}"
         )
     return counts
+
+
+def tknp_cohort_split_point(total: int) -> int:
+    fraction = float(os.environ.get("VLLM_TKNP_DBO_C0_FRACTION", "0.5"))
+    if not 0 < fraction < 1:
+        raise ValueError("TKNP C0 fraction must be strictly between zero and one")
+    if os.environ.get("VLLM_TKNP_DBO_ROOT_REQUESTS") == "0" and fraction != 0.5:
+        raise ValueError("Projection-only TKNP roots currently require equal cohorts")
+    return max(1, min(total - 1, int(total * fraction)))
+
+
+def compute_dbo_tknp_split(
+    num_requests: int,
+    blocks_per_request: int,
+    free_blocks_per_rank: list[int],
+) -> list[int]:
+    """Return a capacity-safe TKNP split for asymmetric two-cohort DBO.
+
+    Attention ranks need at least one request in both cohorts. The root's
+    quota is configurable, including zero for a projection-only root. A zero
+    root slice uses a padded compiler row but owns no KV or attention work.
+    Spread the remaining requests over attention-only ranks so root dense
+    compute can overlap the other cohort's attention.
+
+    The helper is shared by scheduling and CUDA Graph capture; consequently
+    it must remain deterministic for a fixed capacity vector.
+    """
+    if os.environ.get("VLLM_TKNP_DBO_LAYOUT", "asymmetric") == "balanced":
+        return compute_capacity_aware_tknp_split(
+            num_requests, blocks_per_request, free_blocks_per_rank
+        )
+    if num_requests < 0:
+        raise ValueError(f"num_requests must be non-negative, got {num_requests}")
+    if blocks_per_request <= 0:
+        raise ValueError(
+            f"blocks_per_request must be positive, got {blocks_per_request}"
+        )
+    if not free_blocks_per_rank:
+        raise ValueError("free_blocks_per_rank must not be empty")
+
+    world_size = len(free_blocks_per_rank)
+    if world_size == 1 or num_requests < 2 * world_size:
+        return compute_capacity_aware_tknp_split(
+            num_requests, blocks_per_request, free_blocks_per_rank
+        )
+
+    capacities = [
+        max(0, int(free_blocks) // blocks_per_request)
+        for free_blocks in free_blocks_per_rank
+    ]
+    minimum_per_rank = 2
+    root_empty = os.environ.get("VLLM_TKNP_DBO_ROOT_REQUESTS") == "0"
+    if any(capacity < minimum_per_rank for capacity in capacities[1:]) or (
+        not root_empty and capacities[0] < minimum_per_rank
+    ):
+        raise RuntimeError(
+            "TKNP DBO requires capacity for one request per rank in both "
+            f"cohorts: capacity={capacities}"
+        )
+
+    cohort_0_size = tknp_cohort_split_point(num_requests)
+    balanced_root_c0 = max(1, cohort_0_size // world_size)
+    root_count = 0 if root_empty else max(minimum_per_rank, int(os.environ.get(
+        "VLLM_TKNP_DBO_ROOT_REQUESTS", str(balanced_root_c0 + 1)
+    )))
+    if root_count > capacities[0]:
+        raise RuntimeError(
+            "TKNP DBO KV capacity is insufficient on the root rank: "
+            f"required={root_count}, capacity={capacities[0]}"
+        )
+
+    counts = [root_count] + [minimum_per_rank] * (world_size - 1)
+    remaining = num_requests - sum(counts)
+    while remaining > 0:
+        candidates = [
+            rank
+            for rank in range(1, world_size)
+            if counts[rank] < capacities[rank]
+        ]
+        if candidates:
+            rank = min(
+                candidates,
+                key=lambda candidate: (counts[candidate], candidate),
+            )
+        elif not root_empty and counts[0] < capacities[0]:
+            # Capacity pressure may require more C0 work on the root.  This is
+            # preferable to rejecting a workload which still fits globally.
+            rank = 0
+        else:
+            raise RuntimeError(
+                "TKNP DBO KV capacity is insufficient: "
+                f"assigned={counts}, capacity={capacities}, "
+                f"unassigned={remaining}"
+            )
+        counts[rank] += 1
+        remaining -= 1
+
+    return counts
+
+
+def build_tknp_cohort_rank_order(
+    counts: list[int], num_cohorts: int = 2
+) -> list[int]:
+    """Build a request-to-rank order with balanced contiguous cohorts.
+
+    TKNP normally assigns one contiguous request block to each rank.  That is
+    a poor layout for microbatching because the first half of the scheduler
+    batch can contain requests for only a subset of ranks.  This helper keeps
+    the same total per-rank allocation while spreading every rank's requests
+    as evenly as possible across ``num_cohorts`` contiguous scheduler slices.
+
+    The returned list contains one TKNP rank for each request in scheduler
+    order. Cohort sizes differ by at most one request.
+    """
+    if num_cohorts < 1:
+        raise ValueError(f"num_cohorts must be positive, got {num_cohorts}")
+    if any(count < 0 for count in counts):
+        raise ValueError(f"counts must be non-negative, got {counts}")
+
+    cohort_counts = [
+        [count // num_cohorts for _ in range(num_cohorts)] for count in counts
+    ]
+    cohort_totals = [sum(row[i] for row in cohort_counts)
+                     for i in range(num_cohorts)]
+
+    # Place indivisible remainders in the currently smallest cohort. Rotate
+    # tie-breaking by rank so rank 0 is not systematically favored.
+    for rank, count in enumerate(counts):
+        for remainder_idx in range(count % num_cohorts):
+            smallest = min(cohort_totals)
+            candidates = [
+                i for i, total in enumerate(cohort_totals) if total == smallest
+            ]
+            cohort = candidates[(rank + remainder_idx) % len(candidates)]
+            cohort_counts[rank][cohort] += 1
+            cohort_totals[cohort] += 1
+
+    order: list[int] = []
+    for cohort in range(num_cohorts):
+        for rank in range(len(counts)):
+            order.extend([rank] * cohort_counts[rank][cohort])
+
+    assert len(order) == sum(counts)
+    assert max(cohort_totals, default=0) - min(cohort_totals, default=0) <= 1
+    return order
+
+
+def build_tknp_dbo_cohort_rank_order(counts: list[int]) -> list[int]:
+    """Build two contiguous DBO cohorts with a near-empty root C1 slice.
+
+    Attention ranks retain at least one request in each cohort. Rank 0's C1
+    ownership is one by default, or zero with ZERO_ROOT_C1. A projection-only
+    root owns neither cohort. The scheduler and capture share the same fixed
+    split point, including the optional unequal asymmetric cohort sizes.
+    """
+    if os.environ.get("VLLM_TKNP_DBO_LAYOUT", "asymmetric") == "balanced":
+        return build_tknp_cohort_rank_order(counts, num_cohorts=2)
+    if len(counts) < 2:
+        return build_tknp_cohort_rank_order(counts, num_cohorts=2)
+    if counts[0] == 0:
+        return build_tknp_cohort_rank_order(counts, num_cohorts=2)
+    if any(count < 2 for count in counts):
+        return build_tknp_cohort_rank_order(counts, num_cohorts=2)
+
+    total = sum(counts)
+    split_point = tknp_cohort_split_point(total)
+    cohort_targets = [split_point, total - split_point]
+    cohort_counts = [[0, 0] for _ in counts]
+    root_c1 = 0 if os.environ.get("VLLM_TKNP_DBO_ZERO_ROOT_C1", "0") == "1" else 1
+    cohort_counts[0] = [counts[0] - root_c1, root_c1]
+    for rank in range(1, len(counts)):
+        cohort_counts[rank] = [counts[rank] // 2, counts[rank] - counts[rank] // 2]
+    if root_c1 == 0:
+        # Balance the longer C1 attention stage first. Balancing C0 first
+        # can turn rank-total remainders into two-request C1 imbalances.
+        c1_counts = [0] * len(counts)
+        remaining = cohort_targets[1]
+        while remaining:
+            candidates = [rank for rank in range(1, len(counts))
+                          if c1_counts[rank] < counts[rank] - 1]
+            if not candidates:
+                raise RuntimeError("Zero-root C1 needs nonempty C0 work on attention ranks")
+            rank = min(candidates, key=lambda r: (c1_counts[r], r))
+            c1_counts[rank] += 1
+            remaining -= 1
+        cohort_counts = [[count - c1_counts[rank], c1_counts[rank]]
+                         for rank, count in enumerate(counts)]
+
+    delta = cohort_targets[0] - sum(row[0] for row in cohort_counts)
+    while delta != 0:
+        if delta > 0:
+            candidates = [
+                rank for rank in range(1, len(counts))
+                if cohort_counts[rank][1] > 1
+            ]
+            if not candidates:
+                raise RuntimeError(
+                    f"Cannot balance TKNP DBO cohorts for counts={counts}"
+                )
+            rank = min(candidates, key=lambda candidate: (
+                cohort_counts[candidate][0], candidate
+            ))
+            cohort_counts[rank][0] += 1
+            cohort_counts[rank][1] -= 1
+            delta -= 1
+        else:
+            candidates = [
+                rank for rank in range(1, len(counts))
+                if cohort_counts[rank][0] > 1
+            ]
+            if not candidates:
+                raise RuntimeError(
+                    f"Cannot balance TKNP DBO cohorts for counts={counts}"
+                )
+            rank = max(candidates, key=lambda candidate: (
+                cohort_counts[candidate][0], -candidate
+            ))
+            cohort_counts[rank][0] -= 1
+            cohort_counts[rank][1] += 1
+            delta += 1
+
+    order: list[int] = []
+    for cohort in range(2):
+        for rank in range(len(counts)):
+            order.extend([rank] * cohort_counts[rank][cohort])
+
+    assert len(order) == total
+    assert sum(1 for rank in order[cohort_targets[0]:] if rank == 0) == root_c1
+    return order
 
 @dataclass
 class TokenParallelMetadata:
@@ -301,7 +530,12 @@ class ForwardContext:
     ubatch_slices: UBatchSlices | None = None
     
     # TKNP
-    tknp_metadata: Optional[TokenParallelMetadata] = None
+    # The outer UBatchWrapper context carries one entry per microbatch. Each
+    # worker thread installs its individual TokenParallelMetadata before the
+    # compiled model is invoked, so model layers still see a scalar object.
+    tknp_metadata: Optional[
+        TokenParallelMetadata | list[TokenParallelMetadata]
+    ] = None
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
@@ -333,7 +567,9 @@ def create_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
-    tknp_metadata: Optional[TokenParallelMetadata] = None,
+    tknp_metadata: Optional[
+        TokenParallelMetadata | list[TokenParallelMetadata]
+    ] = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -372,7 +608,9 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
-    tknp_metadata: Optional[TokenParallelMetadata] = None,
+    tknp_metadata: Optional[
+        TokenParallelMetadata | list[TokenParallelMetadata]
+    ] = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.

@@ -872,16 +872,23 @@ class VllmConfig:
 
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
-            assert a2a_backend in [
-                "deepep_low_latency",
-                "deepep_high_throughput",
-            ], (
-                "Microbatching currently only supports the deepep_low_latency and "
-                f"deepep_high_throughput all2all backend. {a2a_backend} is not "
-                "supported. To fix use --all2all-backend=deepep_low_latency or "
-                "--all2all-backend=deepep_high_throughput and install the DeepEP"
-                " kernels."
+            is_tknp_ubatching = (
+                self.parallel_config.enable_token_parallel
+                and self.parallel_config.token_parallel_size > 1
+                and self.parallel_config.enable_dbo
             )
+            if not is_tknp_ubatching:
+                assert a2a_backend in [
+                    "deepep_low_latency",
+                    "deepep_high_throughput",
+                ], (
+                    "Microbatching currently only supports the "
+                    "deepep_low_latency and deepep_high_throughput all2all "
+                    f"backend. {a2a_backend} is not supported. To fix use "
+                    "--all2all-backend=deepep_low_latency or "
+                    "--all2all-backend=deepep_high_throughput and install the "
+                    "DeepEP kernels."
+                )
 
             if not self.model_config.disable_cascade_attn:
                 self.model_config.disable_cascade_attn = True

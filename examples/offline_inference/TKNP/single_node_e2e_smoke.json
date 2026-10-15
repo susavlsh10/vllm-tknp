@@ -1,0 +1,31 @@
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "load_format": "auto",
+  "kv_cache_dtype": "auto",
+  "max_model_len": 2048,
+  "max_num_seqs": 16,
+  "max_num_batched_tokens": 2048,
+  "kv_cache_memory_bytes": 536870912,
+  "trials": [
+    {"name": "tknp2-real-pd-eager", "servers": [
+      {"role": "prefill", "gpus": [0], "connector": "nixl"},
+      {"role": "decode", "gpus": [1, 2], "tknp": 2, "connector": "nixl", "placement": "cost"}
+    ]},
+    {"name": "dp2-real-pd", "servers": [
+      {"role": "prefill", "gpus": [0], "connector": "nixl"},
+      {"role": "decode", "gpus": [1], "connector": "nixl", "cuda_graph": true},
+      {"role": "decode", "gpus": [2], "connector": "nixl", "cuda_graph": true}
+    ]},
+    {"name": "tp2-real-pd", "servers": [
+      {"role": "prefill", "gpus": [0], "connector": "nixl"},
+      {"role": "decode", "gpus": [1, 2], "tp": 2, "connector": "nixl", "cuda_graph": true}
+    ]},
+    {"name": "pp2-real-pd", "servers": [
+      {"role": "prefill", "gpus": [0], "connector": "nixl"},
+      {"role": "decode", "gpus": [1, 2], "pp": 2, "connector": "nixl", "cuda_graph": true}
+    ]},
+    {"name": "tp2-dcp2-colocated", "disabled_reason": "Invalid for Llama 8B: this fork requires TP > 8 KV heads for DCP. Valid TP16+DCP2 requires more than this single four-GPU node.", "servers": [
+      {"role": "decode", "gpus": [0, 1], "tp": 2, "dcp": 2, "cuda_graph": true}
+    ]}
+  ]
+}

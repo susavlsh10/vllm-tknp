@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +27,12 @@ from vllm.utils.import_utils import has_deep_gemm
 from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
 
 logger = init_logger(__name__)
+
+
+def _cat_ubatch_outputs(sorted_results: list) -> Any:
+    if sorted_results and isinstance(sorted_results[0], tuple):
+        return tuple(torch.cat(parts, dim=0) for parts in zip(*sorted_results))
+    return torch.cat(sorted_results, dim=0)
 
 
 @dataclass
@@ -103,6 +110,98 @@ class UBatchWrapper:
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.comm_stream = torch.cuda.Stream(device=device)
+        self.tknp_comm_streams = None
+        if os.environ.get("VLLM_TKNP_DBO_SYMM_MEM", "0") == "1":
+            from vllm.distributed.parallel_state import get_tknp_group
+            from vllm.distributed.device_communicators.tknp_symmetric_memory import TKNPSymmetricMemory
+
+            config = vllm_config.model_config
+            parallel = vllm_config.parallel_config
+            if not parallel.enable_token_parallel or parallel.pipeline_parallel_size != 1:
+                raise RuntimeError("Symmetric TKNP requires token parallelism and PP=1")
+            cols = (config.get_num_attention_heads(parallel)
+                    + 2 * config.get_num_kv_heads(parallel)) * config.get_head_size()
+            rows = max(self.compilation_config.cudagraph_capture_sizes)
+            group = get_tknp_group()
+            group.tknp_symmetric_memory = TKNPSymmetricMemory(
+                group.cpu_group, config.get_num_layers(parallel), rows, cols,
+                config.dtype, device,
+                backend=os.environ.get("VLLM_TKNP_SYMM_MEM_BACKEND", "CUDA"))
+            self.tknp_comm_streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+            logger.info("TKNP_ONE_SIDED_MAILBOX rows=%d cols=%d", rows, cols)
+        if (
+            vllm_config.parallel_config.enable_token_parallel
+            and os.environ.get("VLLM_TKNP_DBO_INDEPENDENT_COMM", "0") == "1"
+            and self.tknp_comm_streams is None
+        ):
+            from vllm.distributed.parallel_state import get_tknp_group
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+            group = get_tknp_group()
+            # A waiting C1 gather must not hold C0's next-layer scatter.
+            # Separate NCCL contexts are needed as well as separate streams:
+            # using one communicator preserves the original operation order.
+            group.tknp_dbo_comms = [
+                PyNcclCommunicator(group.cpu_group, device=device)
+                for _ in range(vllm_config.parallel_config.num_ubatches)
+            ]
+            if any(not comm.available for comm in group.tknp_dbo_comms):
+                raise RuntimeError("Independent TKNP cohort communicators unavailable")
+            self.tknp_comm_streams = [
+                torch.cuda.Stream(device=device)
+                for _ in group.tknp_dbo_comms
+            ]
+            logger.info("TKNP_UBATCH_INDEPENDENT_COMM cohorts=%d", len(group.tknp_dbo_comms))
+        if (
+            vllm_config.parallel_config.enable_token_parallel
+            and (
+                os.environ.get("VLLM_TKNP_DBO_INDEPENDENT_TP", "0") == "1"
+                or os.environ.get("VLLM_TKNP_DBO_ROOT_SPLIT_COMPUTE", "0") == "1"
+            )
+        ):
+            from vllm.distributed.parallel_state import get_tknp_group, get_tp_group
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+            # Only the root TP group executes dense layers. Its two compute
+            # streams must not inherit each other's NCCL all-reduce ordering.
+            # Attention ranks retain their ordinary TP communicator (unused by
+            # the parameter-free attention path).
+            tp_group = get_tp_group()
+            if get_tknp_group().rank_in_group == 0 and tp_group.world_size > 1:
+                comms = [
+                    PyNcclCommunicator(tp_group.cpu_group, device=device)
+                    for _ in range(vllm_config.parallel_config.num_ubatches)
+                ]
+                if any(not comm.available for comm in comms):
+                    raise RuntimeError("Independent TP cohort communicators unavailable")
+                tp_group.device_communicator.tknp_dbo_tp_comms = comms
+                logger.info("TKNP_UBATCH_INDEPENDENT_TP cohorts=%d", len(comms))
+                dc = tp_group.device_communicator
+                if (
+                    dc.symm_mem_comm is not None
+                    and not dc.symm_mem_comm.disabled
+                    and os.environ.get("VLLM_TKNP_DBO_INDEPENDENT_TP_SYMM", "1") == "1"
+                ):
+                    from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
+
+                    # A private NCCL context alone must not downgrade the
+                    # baseline's multicast/two-shot TP reduction. Each cohort
+                    # also needs its own symmetric buffer and rendezvous handle
+                    # so concurrent compute streams cannot overwrite scratch.
+                    symm_comms = [
+                        SymmMemCommunicator(tp_group.cpu_group, device=device)
+                        for _ in comms
+                    ]
+                    if any(comm.disabled for comm in symm_comms):
+                        raise RuntimeError("Private TKNP symmetric TP buffers unavailable")
+                    dc.tknp_dbo_tp_symm_comms = symm_comms
+                    logger.info("TKNP_UBATCH_INDEPENDENT_TP_SYMM cohorts=%d", len(symm_comms))
+        # The TKNP root must advance C0's next dense layer without inheriting
+        # C1's attention/receive wait. Sharing one compute stream serializes
+        # those otherwise independent kernels, even when C1's local attention
+        # slice is empty and its only remaining dependency is communication.
+        self.root_c1_compute_stream = torch.cuda.Stream(
+            device=device, priority=int(os.environ.get("VLLM_TKNP_DBO_C1_PRIORITY", "0")))
         # Ubatch threads plus the main thread
         self.ready_barrier = threading.Barrier(
             self.vllm_config.parallel_config.num_ubatches + 1
@@ -212,7 +311,9 @@ class UBatchWrapper:
 
         results: list[tuple[int, torch.Tensor]] = []
         compute_stream = ubatch_metadata[0].context.compute_stream
-        num_tokens = ubatch_metadata[0].num_tokens + ubatch_metadata[1].num_tokens
+        c1_compute_stream = ubatch_metadata[1].context.compute_stream
+        split_compute_streams = c1_compute_stream != compute_stream
+        num_tokens = sum(metadata.num_tokens for metadata in ubatch_metadata)
 
         # Ubatches will manually manage the forward context, so we override
         # it to None here so we can have it restored correctly later
@@ -244,13 +345,24 @@ class UBatchWrapper:
                 stream=compute_stream,
                 pool=self.graph_pool,
             ):
+                if split_compute_streams:
+                    # Capture the fork from prepared inputs and the join before
+                    # concatenating outputs as graph event dependencies.
+                    c1_compute_stream.wait_stream(compute_stream)
                 ubatch_metadata[0].context.cpu_wait_event.set()
                 for thread in ubatch_threads:
                     thread.join()
+                if split_compute_streams:
+                    compute_stream.wait_stream(c1_compute_stream)
                 sorted_results = [value for position, value in sorted(results)]
-                result = torch.cat(sorted_results, dim=0)
+                result = _cat_ubatch_outputs(sorted_results)
                 cudagraph_metadata.outputs = result
             self.cudagraphs[num_tokens] = cudagraph_metadata
+            logger.info(
+                "TKNP_UBATCH_CUDAGRAPH_CAPTURE total_tokens=%d microbatches=%s",
+                num_tokens,
+                tuple(metadata.num_tokens for metadata in ubatch_metadata),
+            )
         return cudagraph_metadata.outputs
 
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
@@ -266,6 +378,9 @@ class UBatchWrapper:
             results.append((ubatch_metadata.context.id, model_output))
 
         results: list[tuple[int, torch.Tensor]] = []
+        compute_stream = ubatch_metadata[0].context.compute_stream
+        c1_compute_stream = ubatch_metadata[1].context.compute_stream
+        split_compute_streams = c1_compute_stream != compute_stream
 
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
@@ -284,11 +399,15 @@ class UBatchWrapper:
                 ubatch_threads.append(thread)
                 thread.start()
             self.ready_barrier.wait()  # Wait for both threads to be ready
+            if split_compute_streams:
+                c1_compute_stream.wait_stream(compute_stream)
             ubatch_metadata[0].context.cpu_wait_event.set()
             for thread in ubatch_threads:
                 thread.join()
+            if split_compute_streams:
+                compute_stream.wait_stream(c1_compute_stream)
         sorted_results = [value for position, value in sorted(results)]
-        result = torch.cat(sorted_results, dim=0)
+        result = _cat_ubatch_outputs(sorted_results)
         return result
 
     def _make_ubatch_metadata(
@@ -301,19 +420,32 @@ class UBatchWrapper:
         intermediate_tensors,
         compute_stream,
         dp_metadata,
+        tknp_metadata,
         batch_descriptor,
         cudagraph_runtime_mode,
     ) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         forward_contexts = []
+        is_tknp_ubatched = isinstance(tknp_metadata, list)
+        split_root_compute = (
+            is_tknp_ubatched
+            and len(ubatch_slices) == 2
+            and tknp_metadata[0].tknp_rank == tknp_metadata[0].root_rank
+            and os.environ.get("VLLM_TKNP_DBO_ROOT_SPLIT_COMPUTE", "0") == "1"
+        )
+        if split_root_compute:
+            logger.info_once("TKNP_UBATCH_ROOT_SPLIT_COMPUTE enabled")
         for i, ubatch_slice in enumerate(ubatch_slices):
             forward_contexts.append(
                 create_forward_context(
                     attn_metadata[i] if attn_metadata is not None else None,
                     self.vllm_config,
-                    dp_metadata=dp_metadata[i],
+                    dp_metadata=dp_metadata[i] if dp_metadata is not None else None,
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    tknp_metadata=(
+                        tknp_metadata[i] if is_tknp_ubatched else tknp_metadata
+                    ),
                 )
             )
 
@@ -323,22 +455,48 @@ class UBatchWrapper:
             compute_stream=compute_stream,
             forward_contexts=forward_contexts,
             ready_barrier=self.ready_barrier,
+            compute_streams=(
+                [compute_stream, self.root_c1_compute_stream]
+                if split_root_compute else None
+            ),
+            comm_streams=self.tknp_comm_streams if is_tknp_ubatched else None,
         )
 
         ubatch_metadata: list[UbatchMetadata] = []
+        local_token_start = 0
         for i, ubatch_slice in enumerate(ubatch_slices):
+            input_slice = ubatch_slice.token_slice
+            position_slice = input_slice
+            if is_tknp_ubatched:
+                metadata = tknp_metadata[i]
+                local_token_stop = local_token_start + int(metadata.local_num_tokens)
+                local_slice = slice(local_token_start, local_token_stop)
+                # Root retains global embedding inputs for the QKV projection,
+                # while every rank (including root) has rank-local positions.
+                if metadata.tknp_rank != metadata.root_rank:
+                    input_slice = local_slice
+                position_slice = local_slice
+                if metadata.tknp_rank == metadata.root_rank and metadata.local_num_tokens == 0:
+                    # Keep a fixed padded shape for the compiled attention op.
+                    # Its implementation skips all KV access for zero actual
+                    # tokens; the gather uses the real zero transfer count.
+                    position_slice = slice(0, 1)
+                local_token_start = local_token_stop
             (
                 sliced_input_ids,
                 sliced_positions,
                 sliced_inputs_embeds,
                 sliced_intermediate_tensors,
             ) = self._slice_model_inputs(
-                ubatch_slice.token_slice,
+                input_slice,
+                position_slice,
                 input_ids,
                 positions,
                 inputs_embeds,
                 intermediate_tensors,
             )
+            if is_tknp_ubatched:
+                tknp_metadata[i]._compile_local_shape_source = sliced_positions
             ubatch_metadata.append(
                 UbatchMetadata(
                     context=ubatch_ctxs[i],
@@ -355,22 +513,27 @@ class UBatchWrapper:
 
     def _slice_model_inputs(
         self,
-        tokens_slice: slice,
+        input_slice: slice,
+        position_slice: slice,
         input_ids,
         positions,
         inputs_embeds,
         intermediate_tensors,
     ):
-        sliced_input_ids = input_ids[tokens_slice]
+        sliced_input_ids = input_ids[input_slice] if input_ids is not None else None
         # if we are using mrope. Mrope adds an additional dimension to the
         # positions tensor
         if positions.ndim == 2:
-            sliced_positions = positions[:, tokens_slice]
+            sliced_positions = positions[:, position_slice]
         else:
-            sliced_positions = positions[tokens_slice]
-        sliced_inputs_embeds = inputs_embeds[tokens_slice] if inputs_embeds else None
+            sliced_positions = positions[position_slice]
+        sliced_inputs_embeds = (
+            inputs_embeds[input_slice] if inputs_embeds is not None else None
+        )
         sliced_intermediate_tensors = (
-            intermediate_tensors[tokens_slice] if intermediate_tensors else None
+            intermediate_tensors[input_slice]
+            if intermediate_tensors is not None
+            else None
         )
 
         return (
@@ -406,9 +569,7 @@ class UBatchWrapper:
                 return self.cudagraph_wrapper(*args, **kwargs)
 
         attn_metadata = forward_context.attn_metadata
-        num_tokens = (
-            ubatch_slices[0].token_slice.stop - ubatch_slices[0].token_slice.start
-        ) * 2
+        num_tokens = sum(ubatch_slice.num_tokens for ubatch_slice in ubatch_slices)
         input_ids = kwargs["input_ids"]
         positions = kwargs["positions"]
         intermediate_tensors = kwargs["intermediate_tensors"]
@@ -416,21 +577,30 @@ class UBatchWrapper:
         compute_stream = torch.cuda.current_stream()
 
         dp_metadata = forward_context.dp_metadata
+        tknp_metadata = forward_context.tknp_metadata
 
-        # We shouldn't be here unless we are running with multiple DP ranks
-        assert dp_metadata is not None
-        ubatch_dp_metadata = []
-        for ubatch_slice in ubatch_slices:
-            dp_size = self.vllm_config.parallel_config.data_parallel_size
-            ubatch_num_tokens_across_dp = torch.tensor(
-                [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-            )
-            ubatch_dp_metadata.append(
-                DPMetadata.make(
-                    self.vllm_config.parallel_config,
-                    ubatch_slice.num_tokens,
-                    ubatch_num_tokens_across_dp,
+        ubatch_dp_metadata = None
+        if dp_metadata is not None:
+            ubatch_dp_metadata = []
+            for ubatch_slice in ubatch_slices:
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                ubatch_num_tokens_across_dp = torch.tensor(
+                    [ubatch_slice.num_tokens] * dp_size,
+                    device="cpu",
+                    dtype=torch.int32,
                 )
+                ubatch_dp_metadata.append(
+                    DPMetadata.make(
+                        self.vllm_config.parallel_config,
+                        ubatch_slice.num_tokens,
+                        ubatch_num_tokens_across_dp,
+                    )
+                )
+
+        if dp_metadata is None and not isinstance(tknp_metadata, list):
+            raise RuntimeError(
+                "Microbatching requires either DP metadata or per-microbatch "
+                "TKNP metadata."
             )
 
         if (
@@ -446,17 +616,21 @@ class UBatchWrapper:
                 inputs_embeds=inputs_embeds,
                 compute_stream=compute_stream,
                 dp_metadata=ubatch_dp_metadata,
+                tknp_metadata=tknp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             with self.sm_control:
-                return self._capture_ubatches(ubatch_metadata, self.model)
+                return self._capture_ubatches(ubatch_metadata, self.runnable)
         elif (
             num_tokens in self.cudagraphs
             and cudagraph_runtime_mode is CUDAGraphMode.FULL
         ):
             cudagraph_metadata = self.cudagraphs[num_tokens]
             cudagraph_metadata.cudagraph.replay()
+            logger.info_once(
+                "TKNP_UBATCH_CUDAGRAPH_REPLAY total_tokens=%d", num_tokens
+            )
             return cudagraph_metadata.outputs
         else:
             ubatch_metadata = self._make_ubatch_metadata(
@@ -468,8 +642,9 @@ class UBatchWrapper:
                 inputs_embeds=inputs_embeds,
                 compute_stream=compute_stream,
                 dp_metadata=ubatch_dp_metadata,
+                tknp_metadata=tknp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             with self.sm_control:
-                return self._run_ubatches(ubatch_metadata, self.model)
+                return self._run_ubatches(ubatch_metadata, self.runnable)

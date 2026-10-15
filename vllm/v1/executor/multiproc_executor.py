@@ -140,6 +140,11 @@ class MultiprocExecutor(Executor):
                 self.world_size,
                 self.local_world_size,
                 max_chunk_bytes=max_chunk_bytes,
+                # A synchronous PP batch queues execute_model and sampling
+                # RPCs before retiring earlier batches. The default ten-slot
+                # ring deadlocks at deep PP: the producer fills it before
+                # reaching the batch-queue retirement threshold.
+                max_chunks=max(10, 2 * self.max_concurrent_batches + 2),
                 connect_ip=self.parallel_config.master_addr,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
@@ -487,7 +492,10 @@ class WorkerProc:
             )
 
             # Initializes a message queue for sending the model output
-            self.worker_response_mq = MessageQueue(1, 1)
+            self.worker_response_mq = MessageQueue(
+                1, 1,
+                max_chunks=max(10, 2 * vllm_config.parallel_config.pipeline_parallel_size + 2),
+            )
             self.peer_response_handles = []
         else:
             # Initialize remote MessageQueue for receiving SchedulerOutput across nodes
@@ -499,13 +507,15 @@ class WorkerProc:
                 # non blocking. The handshake will be triggered when
                 # worker.rpc_broadcast_mq.wait_until_ready() is called
                 blocking=False,
+                max_chunks=max(6, 2 * vllm_config.parallel_config.pipeline_parallel_size + 2),
             )
             # Initializes remote message queue for sending the model output to the
             # driver worker, exposing peer_response_handles for driver worker
             # that include handles for all ranks
             self.worker_response_mq, self.peer_response_handles = (
                 get_inner_dp_world_group().create_single_reader_mq_broadcasters(
-                    reader_rank_in_group=0
+                    reader_rank_in_group=0,
+                    max_chunks=max(6, 2 * vllm_config.parallel_config.pipeline_parallel_size + 2),
                 )
             )
 

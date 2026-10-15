@@ -207,9 +207,15 @@ def make_ubatch_contexts(
     forward_contexts: list[ForwardContext],
     ready_barrier: threading.Barrier,
     schedule: str = "default",
+    compute_streams: Optional[list[torch.cuda.Stream]] = None,
+    comm_streams: Optional[list[torch.cuda.Stream]] = None,
 ) -> list[UBatchContext]:
     global _NUM_UBATCHES, _CURRENT_CONTEXTS
     assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
+    if compute_streams is not None:
+        assert len(compute_streams) == num_micro_batches
+    if comm_streams is not None:
+        assert len(comm_streams) == num_micro_batches
 
     _NUM_UBATCHES = num_micro_batches
     # Ensure the global context list is large enough
@@ -227,8 +233,10 @@ def make_ubatch_contexts(
     for i in range(num_micro_batches):
         ctx = UBatchContext(
             id=i,
-            compute_stream=compute_stream,
-            comm_stream=comm_stream,
+            compute_stream=(
+                compute_streams[i] if compute_streams is not None else compute_stream
+            ),
+            comm_stream=comm_streams[i] if comm_streams is not None else comm_stream,
             forward_context=forward_contexts[i],
             ready_barrier=ready_barrier,
             cpu_wait_event=cpu_events[i],

@@ -500,6 +500,30 @@ class ParallelConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        if self.enable_token_parallel and self.enable_dbo:
+            # The prototype's static cohort ownership is currently configured
+            # through env vars. In particular zero-root tracing specializes a
+            # one-row padding input; that AOT artifact cannot be reused for a
+            # nonzero-root plan. Include every graph/schedule option until these
+            # settings become typed ParallelConfig fields.
+            defaults = {
+                "VLLM_TKNP_DBO_LAYOUT": "asymmetric",
+                "VLLM_TKNP_DBO_ROOT_REQUESTS": "auto",
+                "VLLM_TKNP_DBO_ZERO_ROOT_C1": "0",
+                "VLLM_TKNP_DBO_C0_FRACTION": "0.5",
+                "VLLM_TKNP_DBO_C1_PRIORITY": "0",
+                "VLLM_TKNP_DBO_ROOT_SPLIT_COMPUTE": "0",
+                "VLLM_TKNP_DBO_INDEPENDENT_COMM": "0",
+                "VLLM_TKNP_DBO_INDEPENDENT_TP": "0",
+                "VLLM_TKNP_DBO_INDEPENDENT_TP_SYMM": "1",
+                "VLLM_TKNP_DBO_LOOKAHEAD": "0",
+                "VLLM_TKNP_DBO_SYMM_MEM": "0",
+                "VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS": "0",
+            }
+            factors["tknp_cohort_options"] = {
+                name: os.environ.get(name, default)
+                for name, default in defaults.items()
+            }
         return hash_factors(factors)
 
     def __post_init__(self) -> None:

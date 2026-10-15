@@ -10,6 +10,8 @@ computation for their assigned token partitions.
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import os
+import re
 from typing import Optional, Tuple, Union, List
 from dataclasses import dataclass, fields
 
@@ -34,6 +36,14 @@ from vllm.forward_context import (
 )
 
 from vllm.logger import init_logger
+from vllm.v1.worker.ubatching import (
+    dbo_current_ubatch_id,
+    dbo_enabled,
+    dbo_switch_to_comm_sync,
+    dbo_switch_to_compute_sync,
+    dbo_yield_and_switch_from_compute_to_comm,
+    dbo_yield_and_switch_from_comm_to_compute,
+)
 
 logger = init_logger(__name__)
 
@@ -62,6 +72,9 @@ def _get_pynccl_comm(tknp_group):
     """Extract the PyNcclCommunicator from a TKNP GroupCoordinator, if available."""
     if tknp_group is None:
         return None
+    cohort_comms = getattr(tknp_group, "tknp_dbo_comms", None)
+    if dbo_enabled() and cohort_comms is not None:
+        return cohort_comms[dbo_current_ubatch_id()]
     dc = getattr(tknp_group, 'device_communicator', None)
     if dc is None:
         return None
@@ -103,7 +116,9 @@ class _CommBufferPool:
         The returned tensor is a **narrow view** with the exact requested
         shape ``(rows, cols)``; the underlying storage may be larger.
         """
-        key = name
+        # Two in-flight cohorts must never alias communication storage. Outside
+        # DBO the helper returns slot 0, preserving the existing allocation.
+        key = f"{name}.ubatch{dbo_current_ubatch_id()}"
         buf = self._buffers.get(key)
 
         # Allocate / re-allocate when the existing buffer is too small or
@@ -232,13 +247,14 @@ def _tknp_scatter_impl(
     tokens_per_rank: List[int],
     root_rank: int,
     group_name: str,
-) -> torch.Tensor:
+    layer_slot: int = 0,
+) -> None:
     """Custom-op implementation: scatter from root via pynccl."""
     # Skip NCCL during profile_run to avoid deadlocks caused by
     # asymmetric Inductor compilation times across TKNP ranks.
     if _is_tknp_dummy_run():
         recv_buf.zero_()
-        return recv_buf
+        return
     # Read fresh tokens_per_rank from the forward context so that
     # compiled graphs (which bake the tracing-time value) use the
     # correct runtime split for each CUDA-graph capture size.
@@ -248,18 +264,35 @@ def _tknp_scatter_impl(
     group = _get_tknp_group_by_name(group_name)
     pynccl_comm = _get_pynccl_comm(group)
     rank = pynccl_comm.rank
+    if dbo_enabled():
+        dbo_switch_to_comm_sync()
     if md is not None and md.is_cuda_graph:
         _sync_tknp_capture_comm(group)
     # Slice recv_buf to the actual count for this rank.  The compiled
     # graph may have baked a different (trace-time) buffer size, but
     # the NCCL send/recv sizes must match the runtime split exactly.
     actual_count = tokens_per_rank[rank]
+    if actual_count == 0:
+        # This is a graph padding row, never an actual request or KV entry.
+        recv_buf.zero_()
     recv_buf_actual = recv_buf[:actual_count]
     actual_send = send_buf if rank == root_rank else None
-    _scatter_from_root_nccl(
-        actual_send, recv_buf_actual, tokens_per_rank, root_rank, pynccl_comm,
-    )
-    return recv_buf
+    mailbox = getattr(group, "tknp_symmetric_memory", None)
+    if dbo_enabled() and mailbox is not None:
+        mailbox.scatter(actual_send, recv_buf_actual, tokens_per_rank,
+                        root_rank, layer_slot, dbo_current_ubatch_id())
+    else:
+        _scatter_from_root_nccl(
+            actual_send, recv_buf_actual, tokens_per_rank, root_rank, pynccl_comm,
+        )
+    if dbo_enabled():
+        # Scatter for this cohort is now queued on the communication stream.
+        # Let the other cohort enqueue root compute before waiting for our
+        # receive and starting attention on the compute stream.
+        dbo_yield_and_switch_from_comm_to_compute()
+    # recv_buf is declared mutated and callers consume it directly. Returning
+    # it aliases a custom-op input, violating the torch.library contract.
+    return
 
 
 def _tknp_scatter_fake(
@@ -268,8 +301,9 @@ def _tknp_scatter_fake(
     tokens_per_rank: List[int],
     root_rank: int,
     group_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(recv_buf)
+    layer_slot: int = 0,
+) -> None:
+    return
 
 
 def _tknp_gather_impl(
@@ -278,13 +312,14 @@ def _tknp_gather_impl(
     tokens_per_rank: List[int],
     root_rank: int,
     group_name: str,
+    layer_slot: int = 0,
 ) -> torch.Tensor:
     """Custom-op implementation: gather to root via pynccl."""
     # Skip NCCL during profile_run to avoid deadlocks caused by
     # asymmetric Inductor compilation times across TKNP ranks.
     if _is_tknp_dummy_run():
         recv_buf.zero_()
-        return recv_buf
+        return recv_buf.new_zeros(1)
     # Read fresh tokens_per_rank from the forward context so that
     # compiled graphs (which bake the tracing-time value) use the
     # correct runtime split for each CUDA-graph capture size.
@@ -294,6 +329,14 @@ def _tknp_gather_impl(
     group = _get_tknp_group_by_name(group_name)
     pynccl_comm = _get_pynccl_comm(group)
     rank = pynccl_comm.rank
+    lookahead = dbo_enabled() and os.environ.get("VLLM_TKNP_DBO_LOOKAHEAD", "0") == "1"
+    if lookahead:
+        # Record only this cohort's attention completion before yielding.
+        # C0 resumes, gathers, and publishes next-layer QKV before C1 queues
+        # its gather. This keeps a waiting C1 output receive out of C0's path.
+        dbo_yield_and_switch_from_compute_to_comm()
+    elif dbo_enabled():
+        dbo_switch_to_comm_sync()
     if md is not None and md.is_cuda_graph:
         _sync_tknp_capture_comm(group)
     # Slice send_buf and recv_buf to actual runtime sizes.  The compiled
@@ -306,17 +349,32 @@ def _tknp_gather_impl(
         recv_buf_actual = recv_buf[:actual_total]
     else:
         recv_buf_actual = None
-    _gather_to_root_nccl(
-        send_buf_actual, recv_buf_actual, tokens_per_rank,
-        root_rank, pynccl_comm,
-    )
+    mailbox = getattr(group, "tknp_symmetric_memory", None)
+    if dbo_enabled() and mailbox is not None:
+        mailbox.gather(send_buf_actual, recv_buf_actual, tokens_per_rank,
+                       root_rank, layer_slot, dbo_current_ubatch_id())
+    else:
+        _gather_to_root_nccl(
+            send_buf_actual, recv_buf_actual, tokens_per_rank,
+            root_rank, pynccl_comm,
+        )
+    if lookahead:
+        dbo_switch_to_compute_sync()
+    elif dbo_enabled():
+        # Queue the attention result transfer, then advance the other cohort.
+        # Resumption waits for this gather before root executes o_proj/MLP.
+        dbo_yield_and_switch_from_comm_to_compute()
     if rank != root_rank:
         # Return a material token to the compiled non-root graph.  The value
         # is deliberately zero so it can be added to the dummy hidden state,
         # while the data dependency prevents Inductor from deleting the NCCL
         # send as an unobservable side effect.
         recv_buf.zero_()
-    return recv_buf
+        # The token is one element, so this copy is negligible. It must not
+        # alias a mutated input; the compiled data edge still retains sends.
+        return recv_buf.clone()
+    # Root consumers read the mutated gather buffer, not this return value.
+    return recv_buf.new_empty(1)
 
 
 def _tknp_gather_fake(
@@ -325,8 +383,9 @@ def _tknp_gather_fake(
     tokens_per_rank: List[int],
     root_rank: int,
     group_name: str,
+    layer_slot: int = 0,
 ) -> torch.Tensor:
-    return torch.empty_like(recv_buf)
+    return recv_buf.new_empty(1)
 
 
 def _get_tknp_group_by_name(group_name: str):
@@ -371,6 +430,8 @@ class TokenParallelQKVLinear(QKVParallelLinear):
 
     def __init__(self, *args, **kwargs):
         nn.Module.__init__(self)
+        layer_match = re.search(r"\.layers\.(\d+)\.", kwargs.get("prefix", ""))
+        self.tknp_layer_slot = int(layer_match.group(1)) if layer_match else 0
 
         # ---- token-parallel topology ---------------------------------
         self.is_tknp_enabled = is_tknp_initialized()
@@ -518,6 +579,8 @@ class TokenParallelQKVLinear(QKVParallelLinear):
                 qkv_local = x.new_empty(x.size(0), qkv_dim)
         else:
             recv_count = tokens_per_rank[self.tknp_rank]
+            if self.is_root_rank and recv_count == 0:
+                recv_count = 1
             qkv_local = self._buf_pool.get(
                 "qkv_recv", recv_count, qkv_dim, dtype, self.device,
             )
@@ -538,6 +601,7 @@ class TokenParallelQKVLinear(QKVParallelLinear):
             torch.ops.vllm.tknp_scatter(
                 send_for_op, qkv_local,
                 tokens_per_rank, root_rank, self.tknp_group_name,
+                self.tknp_layer_slot,
             )
         else:
             # Fallback: torch.distributed all_to_all_single
@@ -632,6 +696,8 @@ class TokenParallelRowLinear(RowParallelLinear):
 
     def __init__(self, *args, **kwargs):
         nn.Module.__init__(self)
+        layer_match = re.search(r"\.layers\.(\d+)\.", kwargs.get("prefix", ""))
+        self.tknp_layer_slot = int(layer_match.group(1)) if layer_match else 0
 
         # ---- token-parallel topology ---------------------------------
         self.is_tknp_enabled = is_tknp_initialized()
@@ -714,7 +780,8 @@ class TokenParallelRowLinear(RowParallelLinear):
         # Skip size check during torch.compile tracing to avoid
         # specializing the dynamic dimension.
         if (not torch.compiler.is_compiling()
-                and x.size(0) != local_count):
+                and x.size(0) != local_count
+                and not (self.is_root_rank and local_count == 0 and x.size(0) == 1)):
             logger.warning(
                 "Rank %d: expected %d tokens, got %d – falling back.",
                 self.tknp_rank, local_count, x.size(0),
@@ -738,6 +805,7 @@ class TokenParallelRowLinear(RowParallelLinear):
                 torch.ops.vllm.tknp_gather(
                     x, gathered_input,
                     tokens_per_rank, root_rank, self.tknp_group_name,
+                    self.tknp_layer_slot,
                 )
                 return super().forward(gathered_input)
             else:
@@ -745,22 +813,19 @@ class TokenParallelRowLinear(RowParallelLinear):
                 gather_token = torch.ops.vllm.tknp_gather(
                     x, dummy_recv,
                     tokens_per_rank, root_rank, self.tknp_group_name,
+                    self.tknp_layer_slot,
                 )
-                if torch.compiler.is_compiling():
-                    # Dynamic size from attention output so residual
-                    # connection sees matching shapes.
-                    dummy = x.new_zeros(x.size(0), self.output_size_full)
-                else:
-                    dummy = self._buf_pool.get(
-                        "dummy_output", local_count,
-                        self.output_size_full, x.dtype, x.device,
-                    )
                 # Keep the communication custom op data-dependent on the
                 # compiled result.  The implementation zeros this one-element
                 # token after recording the send, so numerical behavior is
                 # unchanged while the NCCL operation cannot be eliminated.
                 metadata._compile_comm_token = gather_token
-                dummy = dummy + gather_token[0].to(dummy.dtype)
+                # Non-root dense/norm wrappers are identities, and the next
+                # QKV scatter consumes only the shape plus the explicit token
+                # dependency above. A broadcast view retains that dependency
+                # without zeroing/adding a full hidden tensor every layer.
+                dummy = gather_token.view(1, 1).expand(
+                    x.size(0), self.output_size_full)
                 return dummy, None
         else:
             # Fallback: torch.distributed all_to_all_single

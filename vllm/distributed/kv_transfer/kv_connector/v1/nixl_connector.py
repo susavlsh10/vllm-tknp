@@ -2176,7 +2176,10 @@ class NixlConnectorWorker:
 
         # Number of D TP workers that will read from dst P. Propagate info
         # on notification so that dst worker can wait before freeing blocks.
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        # A layer-sharded research PP decoder has multiple consumers per TP
+        # shard. Default behavior/wire format is unchanged for ordinary NIXL.
+        consumers = getattr(self, "notification_consumer_count", self.world_size)
+        notif_id = f"{remote_request_id}:{consumers}".encode()
 
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.

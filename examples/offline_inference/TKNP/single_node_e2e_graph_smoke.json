@@ -1,0 +1,33 @@
+{
+  "scope": "Single-node real-weight infrastructure/queueing check; small, artificially capped KV pools, not a paper throughput or capacity claim",
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "load_format": "auto",
+  "kv_cache_dtype": "auto",
+  "max_model_len": 2048,
+  "max_num_seqs": 16,
+  "max_num_batched_tokens": 2048,
+  "kv_cache_memory_bytes": 536870912,
+  "warmup_requests": 8,
+  "trials": [
+    {"name": "tknp2-graph-dbo-off", "servers": [
+      {"role": "prefill", "gpus": [0], "connector": "nixl", "kv_cache_memory_bytes": 4294967296},
+      {"role": "decode", "gpus": [1, 2], "tknp": 2, "connector": "nixl", "placement": "cost",
+       "cuda_graph": true, "graph_slots": true, "graph_batch_size": 8, "owner_counts": [2, 6],
+       "env": {"VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS": "256", "VLLM_TKNP_REQUIRE_CUDAGRAPH": "1"}}
+    ]},
+    {"name": "tknp2-graph-dbo-on", "servers": [
+      {"role": "prefill", "gpus": [0], "connector": "nixl", "kv_cache_memory_bytes": 4294967296},
+      {"role": "decode", "gpus": [1, 2], "tknp": 2, "connector": "nixl", "placement": "cost",
+       "cuda_graph": true, "graph_slots": true, "graph_batch_size": 8, "owner_counts": [2, 6], "enable_dbo": true,
+       "env": {"VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS": "256", "VLLM_TKNP_REQUIRE_CUDAGRAPH": "1",
+               "VLLM_TKNP_DBO_ROOT_REQUESTS": "2", "VLLM_TKNP_DBO_ZERO_ROOT_C1": "1",
+               "VLLM_TKNP_DBO_INDEPENDENT_COMM": "1", "VLLM_TKNP_DBO_ROOT_SPLIT_COMPUTE": "1",
+               "VLLM_TKNP_DBO_LOOKAHEAD": "0", "VLLM_TKNP_DBO_LAYOUT": "asymmetric"}}
+    ]},
+    {"name": "dp2-graph-queue", "servers": [
+      {"role": "prefill", "gpus": [0], "connector": "nixl", "kv_cache_memory_bytes": 4294967296},
+      {"role": "decode", "gpus": [1], "connector": "nixl", "cuda_graph": true},
+      {"role": "decode", "gpus": [2], "connector": "nixl", "cuda_graph": true}
+    ]}
+  ]
+}

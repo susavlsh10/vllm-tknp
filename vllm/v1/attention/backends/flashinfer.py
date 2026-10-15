@@ -13,7 +13,7 @@ from flashinfer import (
     BatchPrefillWithRaggedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper,
 )
-from flashinfer.decode import _get_range_buf, trtllm_batch_decode_with_kv_cache
+from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
 from typing_extensions import override
@@ -70,10 +70,21 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+trtllm_gen_cohort_workspace_buffers = {}
 
 
 def _get_trtllm_gen_workspace_buffer():
     global trtllm_gen_workspace_buffer
+    from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
+    if dbo_enabled():
+        # Concurrent root attention kernels must not reset or write the same
+        # TRTLLM scratch/counter workspace. Keep addresses fixed per cohort.
+        cohort = dbo_current_ubatch_id()
+        if cohort not in trtllm_gen_cohort_workspace_buffers:
+            trtllm_gen_cohort_workspace_buffers[cohort] = torch.zeros(
+                envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                dtype=torch.uint8, device="cuda")
+        return trtllm_gen_cohort_workspace_buffers[cohort]
     if trtllm_gen_workspace_buffer is None:
         trtllm_gen_workspace_buffer = torch.zeros(
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
@@ -871,13 +882,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # and can be expensive to retrieve in async mode.
         needs_seq_lens_cpu = self.use_dcp or use_cascade or not is_only_trtllm_decode
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
-        seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
-        num_blocks_np = (
-            (seq_lens_np + (page_size - 1)) // page_size
-            if seq_lens_np is not None
-            else None
-        )
-
         # Adjust seq_lens_cpu for DCP
         if self.use_dcp:
             assert seq_lens_cpu is not None
@@ -898,6 +902,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.dcp_rank,
                 self.dcp_kv_cache_interleave_size,
             )
+
+        # FlashInfer consumes this rank's physical KV pages. In DCP a logical
+        # sequence is striped across ranks, so both the page indptr and the
+        # last-page lengths must use LOCAL lengths, not the pre-DCP lengths.
+        # Keeping a numpy view of the global tensor here reads past each
+        # request's allocated page table during graph replay.
+        seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
+        num_blocks_np = (
+            (seq_lens_np + (page_size - 1)) // page_size
+            if seq_lens_np is not None
+            else None
+        )
 
         # Adjust num_block_np for cascade attention
         if use_cascade:
@@ -1650,40 +1666,32 @@ def fast_plan_decode(
     # host-to-device copy for the last_page_len buffer
     self._paged_kv_last_page_len_buf.copy_(last_page_len_cpu, non_blocking=True)
 
-    qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
-
-    try:
-        # Make sure we pass exactly 19 arguments for tensor core version
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_host,
-            indptr_cpu,
-            seq_lens_cpu,
-            batch_size,  # total_num_rows
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            head_dim,
-            head_dim,
-            False,  # causal
-            window_left,
-            fixed_split_size,
-            disable_split_kv,
-            0,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Error in tensor core plan: {e}") from e
-
-    self._pos_encoding_mode = pos_encoding_mode
-    self._window_left = window_left
-    self._logits_soft_cap = logits_soft_cap
-    self._sm_scale = sm_scale
-    self._rope_scale = rope_scale
-    self._rope_theta = rope_theta
+    # The private JIT plan ABI differs across FlashInfer versions/backends
+    # (e.g. fa2 now adds uniform_q_len). Delegate argument selection to the
+    # installed library, as the newer vLLM backend does. Keep the copies above:
+    # FlashInfer's fast planner deliberately does not stage graph metadata.
+    fast_decode_plan(
+        self,
+        indptr=indptr_cpu,
+        indices=indices,
+        last_page_len=last_page_len_cpu,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pos_encoding_mode=pos_encoding_mode,
+        window_left=window_left,
+        logits_soft_cap=logits_soft_cap,
+        q_data_type=q_data_type,
+        kv_data_type=kv_data_type,
+        data_type=data_type,
+        sm_scale=sm_scale,
+        rope_scale=rope_scale,
+        rope_theta=rope_theta,
+        non_blocking=non_blocking,
+        fixed_split_size=fixed_split_size,
+        disable_split_kv=disable_split_kv,
+    )
 
 
 @triton.jit

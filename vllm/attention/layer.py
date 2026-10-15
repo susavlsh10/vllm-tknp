@@ -704,6 +704,9 @@ def unified_attention(
     value: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
+    metadata = getattr(get_forward_context(), "tknp_metadata", None)
+    if metadata is not None and metadata.tknp_enabled and metadata.local_num_tokens == 0:
+        return torch.zeros_like(query)
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
 
@@ -736,6 +739,10 @@ def unified_attention_with_output(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
 ) -> None:
+    metadata = getattr(get_forward_context(), "tknp_metadata", None)
+    if metadata is not None and metadata.tknp_enabled and metadata.local_num_tokens == 0:
+        output.zero_()
+        return
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
     self.impl.forward(
         self,

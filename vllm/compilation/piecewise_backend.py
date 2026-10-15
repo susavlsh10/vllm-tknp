@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -15,6 +16,12 @@ from vllm.config.compilation import Range
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Standalone Inductor compilation/cache serialization uses process-global
+# artifact collectors. Two DBO cohorts can discover different static shapes
+# on their first forward; compiling them concurrently corrupts those collectors.
+# Only cold compilation is serialized, never graph execution or replay.
+_SHAPE_COMPILE_LOCK = threading.RLock()
 
 
 @dataclasses.dataclass
@@ -129,29 +136,30 @@ class PiecewiseBackend:
         return fake_example_inputs
 
     def _maybe_compile_for_range_entry(self, range_entry: RangeEntry, args) -> Any:
-        if not range_entry.compiled:
-            range_entry.compiled = True
-            self.to_be_compiled_ranges.remove(range_entry.compile_range)
-
-            # args are real arguments
-            # fakify for range, real args for concrete size.
-            # For concrete size, we clear the shape env in
-            # compiler_manager.compile() so no need to fakify.
-            args = (
+        if range_entry.compiled:
+            return
+        with _SHAPE_COMPILE_LOCK:
+            if range_entry.compiled:
+                return
+            # Publish compiled=True only after the runnable exists. A failed
+            # compilation remains retryable rather than exposing runnable=None.
+            compile_args = (
                 self._fakify_args(args)
                 if not range_entry.compile_range.is_single_size()
                 else args
             )
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+            runnable = self.vllm_backend.compiler_manager.compile(
                 self.graph,
-                args,
+                compile_args,
                 self.vllm_backend.inductor_config,
                 self.compilation_config,
                 compile_range=range_entry.compile_range,
                 graph_index=self.piecewise_compile_index,
                 num_graphs=self.total_piecewise_compiles,
             )
-
+            range_entry.runnable = runnable
+            range_entry.compiled = True
+            self.to_be_compiled_ranges.remove(range_entry.compile_range)
             self.check_for_ending_compilation()
 
     def _find_range_for_shape(self, runtime_shape: int) -> Range | None:

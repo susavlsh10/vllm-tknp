@@ -234,5 +234,8 @@ examples/offline_inference/TKNP/tknp_data/*
 examples/offline_inference/TKNP/graphs/*
 examples/offline_inference/TKNP/paper.md
 examples/offline_inference/TKNP/llama_diff.diff
-examples/offline_inference/TKNP/jobs/*.sh
+# Research launchers are source, including workers called by Python controllers.
+/ubatch_results/
+/.deps.failed-no-git/
+/vllm/vllm/
 logs/*

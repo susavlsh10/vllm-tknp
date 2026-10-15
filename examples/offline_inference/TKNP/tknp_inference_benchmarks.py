@@ -44,6 +44,9 @@ import random
 import numpy as np
 import csv
 import os
+import time
+import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -62,6 +65,8 @@ def parse_args():
                         help="Number of token parallel processes (default: 1)")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
                         help="Model name (default: meta-llama/Llama-3.1-8B-Instruct)")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="Optional cached tokenizer for architecture-only models")
     # parser.add_argument("--max-model-len", type=int, default=131072,
     #                     help="Maximum model length (default: 131072)")
     parser.add_argument("--seed", type=int, default=1,
@@ -95,8 +100,50 @@ def parse_args():
                         help="Weight loading format. Use 'dummy' for random weights (default, faster for benchmarking) or 'auto' for real weights")
     parser.add_argument("--cuda-graph", action="store_true",
                         help="Enable CUDA Graph execution (default: eager mode)")
+    parser.add_argument("--cuda-graph-mode", choices=["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"],
+                        default="FULL_AND_PIECEWISE",
+                        help="FULL avoids extra NCCL-containing piecewise graph captures during initialization")
+    parser.add_argument(
+        "--enable-dbo",
+        action="store_true",
+        help="Enable the fixed two-microbatch TKNP overlap prototype",
+    )
+    parser.add_argument("--steady-state-metrics", action="store_true",
+                        help="Time full-batch decode engine steps; exclude request insertion, first four steps and final four steps")
+    parser.add_argument("--dump-token-ids", action="store_true",
+                        help="Save request-ordered output token IDs for deterministic A/B correctness checks")
+    parser.add_argument("--dump-first-step-logits", action="store_true",
+                        help="Correctness diagnostic: save the first main-run logits on rank zero, outside steady-state timing")
+    parser.add_argument("--kv-cache-dtype", choices=["auto", "fp8"], default="auto",
+                        help="Match KV cache precision in every compared configuration")
+    parser.add_argument("--disable-custom-all-reduce", action="store_true",
+                        help="Use NCCL for TP collective scheduling experiments")
+    parser.add_argument("--graph-replay-bench-iters", type=int, default=0,
+                        help="Diagnostic only: replay the fixed captured model graph after generation")
     parser.add_argument("--cudagraph-capture-sizes", type=int, nargs="+",
                         help="CUDA Graph capture sizes (useful for bounded smoke tests)")
+    parser.add_argument(
+        "--torch-profiler-dir",
+        type=str,
+        help=(
+            "Absolute directory for worker-side PyTorch CPU/CUDA traces. "
+            "Profiling starts after decode warmup and is disabled when omitted."
+        ),
+    )
+    parser.add_argument("--profile-after-benchmark", action="store_true",
+                        help="Keep throughput unprofiled, then collect a separate short trace run")
+    parser.add_argument(
+        "--torch-profiler-delay-iters",
+        type=int,
+        default=4,
+        help="Worker iterations to skip before profiling (default: 4)",
+    )
+    parser.add_argument(
+        "--torch-profiler-max-iters",
+        type=int,
+        default=8,
+        help="Steady-state worker iterations to profile (default: 8)",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="Fraction of GPU memory available to vLLM (default: 0.9)")
     parser.add_argument("--decode-context-parallel-size", type=int, default=1,
@@ -294,6 +341,72 @@ def check_kv_cache_capacity(llm, args):
     
     return fits, total_kv_cache_tokens, required_tokens, max_concurrency
 
+def benchmark_captured_graph(worker, batch, iterations):
+    worker = getattr(worker, "worker", worker)
+    runner = worker.model_runner
+    model = runner.model
+    local_inputs = getattr(runner, "_tknp_graph_diagnostic_inputs", None)
+    if local_inputs is None:
+        if not (runner.root_rank and runner._tknp_graph_splits[batch][0] == 0):
+            raise RuntimeError("Graph diagnostic requires preserved rank-local inputs")
+    else:
+        query_starts, seq_lens, tables = local_inputs
+        runner.query_start_loc.gpu[:query_starts.numel()].copy_(query_starts)
+        runner.seq_lens.gpu[:seq_lens.numel()].copy_(seq_lens)
+        for gid, (blocks, slots) in enumerate(tables):
+            table = runner.input_batch.block_table[gid]
+            table.get_device_tensor(blocks.size(0)).copy_(blocks)
+            table.slot_mapping.gpu[:slots.numel()].copy_(slots)
+    if hasattr(model, "cudagraphs"):
+        graph = model.cudagraphs[batch].cudagraph
+    else:
+        entries = [entry for key, entry in model.concrete_cudagraph_entries.items()
+                   if key.num_tokens == batch and entry.cudagraph is not None]
+        if len(entries) != 1:
+            raise RuntimeError(f"Expected one exact graph, found {len(entries)}")
+        graph = entries[0].cudagraph
+    dist.barrier()
+    torch.cuda.synchronize()
+    for _ in range(4):
+        graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    return {"rank": dist.get_rank(), "iterations": iterations,
+            "rank_local_metadata_preserved": True,
+            "model_graph_ms": start.elapsed_time(end) / iterations}
+
+
+def install_first_step_logits_dump(worker, output_dir):
+    """Compare numerical outputs when microbatch GEMMs change BF16 rounding."""
+    if dist.get_rank() != 0:
+        return
+    runner = worker.model_runner
+    original = runner.model.compute_logits
+    dumped = False
+
+    def compute_and_dump(hidden_states):
+        nonlocal dumped
+        logits = original(hidden_states)
+        if not dumped and logits is not None:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "logits": logits.detach().cpu(),
+                "request_ordinals": [int(req_id.split("-", 1)[0])
+                                     for req_id in runner.input_batch.req_ids],
+            }, Path(output_dir) / "first_step_logits.pt")
+            dumped = True
+        return logits
+
+    runner.model.compute_logits = compute_and_dump
+
+
 def inference_benchmark(llm, prompts, args):
     """
     Benchmark decode performance with skip-prefill enabled.
@@ -315,6 +428,7 @@ def inference_benchmark(llm, prompts, args):
         print(f"Decode tokens: {args.decode_tokens}")
         print(f"TKNP: {args.token_parallel_size}, TP: {args.tensor_parallel_size}, PP: {args.pipeline_parallel_size}")
         print(f"Skip-prefill: {args.skip_prefill}")
+        print(f"Two-microbatch overlap: {args.enable_dbo}")
         print(f"{'='*60}\n")
 
     # ===== Stage 1: Warmup Run (10 tokens) =====
@@ -343,6 +457,9 @@ def inference_benchmark(llm, prompts, args):
     # ===== Stage 2: Timed Benchmark Run =====
     if dist.get_rank() == 0:
         print(f"Stage 2: Running main benchmark with {args.decode_tokens} tokens...")
+
+    if args.dump_first_step_logits:
+        llm.collective_rpc(install_first_step_logits_dump, args=(args.output_dir,))
     
     decode_tokens = args.decode_tokens
     main_sampling_params = SamplingParams(
@@ -352,13 +469,97 @@ def inference_benchmark(llm, prompts, args):
     main_start = torch.cuda.Event(enable_timing=True)
     main_end = torch.cuda.Event(enable_timing=True)
     
+    dist.barrier()
     torch.cuda.synchronize()
+
+    profile_this_run = bool(args.torch_profiler_dir) and not args.profile_after_benchmark and not getattr(
+        args, "_torch_profile_complete", False
+    )
+    if profile_this_run:
+        if dist.get_rank() == 0:
+            print(
+                "Starting worker-side PyTorch profiler: "
+                f"dir={args.torch_profiler_dir}, "
+                f"delay_iters={args.torch_profiler_delay_iters}, "
+                f"max_iters={args.torch_profiler_max_iters}"
+            )
+        llm.start_profile()
+        dist.barrier()
+        torch.cuda.synchronize()
+
     main_start.record()
     
-    outputs = llm.generate(prompts, main_sampling_params, use_tqdm=(dist.get_rank() == 0))
+    step_records = []
+    original_step = llm.llm_engine.step
+    if args.steady_state_metrics:
+        def timed_step(*step_args, **step_kwargs):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            begin = time.perf_counter()
+            live_requests = llm.llm_engine.get_num_unfinished_requests()
+            start.record()
+            step_outputs = original_step(*step_args, **step_kwargs)
+            end.record()
+            step_records.append((start, end, (time.perf_counter() - begin) * 1000,
+                                 live_requests, any(out.finished for out in step_outputs)))
+            return step_outputs
+        llm.llm_engine.step = timed_step
+    try:
+        outputs = llm.generate(prompts, main_sampling_params, use_tqdm=(dist.get_rank() == 0))
+    finally:
+        llm.llm_engine.step = original_step
     
     main_end.record()
     torch.cuda.synchronize()
+
+    if args.steady_state_metrics:
+        steady = [entry for entry in step_records[4:-4]
+                  if entry[3] == args.batch_size and not entry[4]]
+        if not steady:
+            raise RuntimeError("No full-batch steady-state decode steps were measured")
+        gpu_ms = [start.elapsed_time(end) for start, end, _, _, _ in steady]
+        wall_ms = [entry[2] for entry in steady]
+        steady_metrics = {
+            "rank": dist.get_rank(), "batch": args.batch_size,
+            "context": args.seq_length, "enable_dbo": args.enable_dbo,
+            "profiled": profile_this_run, "steps": len(steady),
+            "model": args.model, "load_format": args.load_format,
+            "kv_cache_dtype": args.kv_cache_dtype,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "token_parallel_size": args.token_parallel_size,
+            "pipeline_parallel_size": args.pipeline_parallel_size,
+            "requested_decode_tokens": decode_tokens,
+            "cuda_graph_mode": args.cuda_graph_mode,
+            "gpu_step_ms_mean": float(np.mean(gpu_ms)),
+            "wall_step_ms_mean": float(np.mean(wall_ms)),
+            "wall_step_ms_median": float(np.median(wall_ms)),
+            "steady_decode_tps": args.batch_size * len(steady) * 1000 / sum(wall_ms),
+        }
+        print("STEADY_STATE_DECODE " + json.dumps(steady_metrics), flush=True)
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        with open(Path(args.output_dir) / f"steady_rank{dist.get_rank()}.json", "w") as handle:
+            json.dump(steady_metrics, handle, indent=2)
+
+    if args.dump_token_ids and dist.get_rank() == 0:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        token_records = [{
+            "prompt_sha256": hashlib.sha256(json.dumps(out.prompt_token_ids).encode()).hexdigest(),
+            "output_token_ids": [list(completion.token_ids) for completion in out.outputs],
+        } for out in outputs]
+        with open(Path(args.output_dir) / "output_token_ids.json", "w") as handle:
+            json.dump(token_records, handle)
+
+    if args.graph_replay_bench_iters:
+        result = llm.collective_rpc(benchmark_captured_graph,
+                                   args=(args.batch_size, args.graph_replay_bench_iters))
+        print("MODEL_GRAPH_DIAGNOSTIC " + json.dumps(result), flush=True)
+
+    if profile_this_run:
+        llm.stop_profile()
+        args._torch_profile_complete = True
+        dist.barrier()
+        if dist.get_rank() == 0:
+            print(f"PYTORCH_PROFILE_COMPLETE dir={args.torch_profiler_dir}")
     
     main_time_ms = main_start.elapsed_time(main_end)
     
@@ -443,14 +644,50 @@ def setup_vllm_model(args):
         "enforce_eager": not args.cuda_graph,
         "enable_prefix_caching": False,  # Disable prefix caching for benchmarking
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "max_num_batched_tokens": 1024 if args.skip_prefill else 32768,  # max number of tokens in a single forward pass
+        "max_num_batched_tokens": max(1024, args.batch_size) if args.skip_prefill else 32768,
         "load_format": args.load_format,  # Weight loading format
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "max_num_seqs": max(256, args.batch_size),
+        "disable_custom_all_reduce": args.disable_custom_all_reduce,
         # "attention_config": AttentionConfig(backend="FLASHINFER"),# FLASH_ATTN, FLASHINFER
         # "max_model_len": 32768,
     }
 
+    if args.tokenizer is not None:
+        llm_kwargs["tokenizer"] = args.tokenizer
+
+    if args.cuda_graph:
+        llm_kwargs["compilation_config"] = {"cudagraph_mode": args.cuda_graph_mode}
+
+    if args.enable_dbo:
+        if args.token_parallel_size < 2:
+            raise ValueError("--enable-dbo prototype requires token parallelism")
+        if not args.cuda_graph:
+            raise ValueError("--enable-dbo prototype requires --cuda-graph")
+        llm_kwargs["enable_dbo"] = True
+        llm_kwargs["dbo_decode_token_threshold"] = 2
+
     if args.cudagraph_capture_sizes:
         llm_kwargs["cudagraph_capture_sizes"] = args.cudagraph_capture_sizes
+
+    if args.torch_profiler_dir:
+        profile_dir = Path(args.torch_profiler_dir)
+        if not profile_dir.is_absolute():
+            raise ValueError("--torch-profiler-dir must be an absolute path")
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        llm_kwargs["profiler_config"] = {
+            "profiler": "torch",
+            "torch_profiler_dir": str(profile_dir),
+            "torch_profiler_with_stack": False,
+            "torch_profiler_with_flops": False,
+            "torch_profiler_use_gzip": True,
+            "torch_profiler_dump_cuda_time_total": False,
+            "torch_profiler_record_shapes": False,
+            "torch_profiler_with_memory": False,
+            "ignore_frontend": True,
+            "delay_iterations": args.torch_profiler_delay_iters,
+            "max_iterations": args.torch_profiler_max_iters,
+        }
     
     # Only add token parallel configs if token parallelism is enabled
     if args.token_parallel_size >= 2:
@@ -512,6 +749,18 @@ def run_inference_benchmark(args, llm, batch_size, seq_length):
     # catch RuntimeError
     try:
         inference_benchmark(llm, prompts, args)
+        if args.profile_after_benchmark:
+            import copy
+
+            if not args.torch_profiler_dir:
+                raise ValueError("--profile-after-benchmark needs --torch-profiler-dir")
+            profile_args = copy.copy(args)
+            profile_args.profile_after_benchmark = False
+            profile_args._torch_profile_complete = False
+            profile_args.decode_tokens = min(64, args.decode_tokens)
+            profile_args.output_dir = str(Path(args.output_dir) / "profile_only")
+            profile_args.dump_first_step_logits = False
+            inference_benchmark(llm, prompts, profile_args)
     except Exception as e:
         if dist.get_rank() == 0:
             print(f"Error during inference benchmark: {e}")

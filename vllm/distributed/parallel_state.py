@@ -387,28 +387,28 @@ class GroupCoordinator:
         )
 
     def create_mq_broadcaster(
-        self, writer_rank=0, external_writer_handle=None, blocking=True
+        self, writer_rank=0, external_writer_handle=None, blocking=True, max_chunks=6
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
         return MessageQueue.create_from_process_group(
             self.cpu_group,
             1 << 22,
-            6,
+            max_chunks,
             writer_rank=writer_rank,
             external_writer_handle=external_writer_handle,
             blocking=blocking,
         )
 
     def create_single_reader_mq_broadcasters(
-        self, reader_rank_in_group=0, blocking=False
+        self, reader_rank_in_group=0, blocking=False, max_chunks=6
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
         return MessageQueue.create_from_process_group_single_reader(
             self.cpu_group,
             1 << 22,
-            6,
+            max_chunks,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
         )
