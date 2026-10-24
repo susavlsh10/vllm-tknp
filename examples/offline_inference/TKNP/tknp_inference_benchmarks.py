@@ -711,6 +711,8 @@ def setup_vllm_model(args):
         llm_kwargs["decode_context_parallel_size"] = args.decode_context_parallel_size
 
     llm = LLM(**llm_kwargs)
+    from e2e_server import warm_sampling_collectives
+    llm.collective_rpc(warm_sampling_collectives)
     if dist.get_rank() == 0:
         print(f"LLM initialized with tensor_parallel_size={args.tensor_parallel_size}, "
               f"pipeline_parallel_size={args.pipeline_parallel_size}, "

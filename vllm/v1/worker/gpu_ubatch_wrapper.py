@@ -29,6 +29,30 @@ from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
 logger = init_logger(__name__)
 
 
+def _warmup_tknp_cohort_p2p(comm, stream) -> None:
+    """Establish the root-star links before KV sizing and CUDA capture.
+
+    The communicator constructor only warms an all-reduce. NCCL may defer
+    other peer transports/buffers until their first Send/Recv, which must
+    not happen for the first time inside a memory-full graph capture.
+    Send and receive storage is disjoint, including on the root.
+    """
+    send = torch.zeros(comm.world_size, device=comm.device, dtype=torch.bfloat16)
+    recv = torch.empty_like(send)
+    if send.is_cuda:
+        stream.wait_stream(torch.cuda.current_stream(comm.device))
+    comm.group_start()
+    if comm.rank == 0:
+        for peer in range(1, comm.world_size):
+            comm.send(send[peer:peer + 1], peer, stream=stream)
+            comm.recv(recv[peer:peer + 1], peer, stream=stream)
+    else:
+        comm.recv(recv[:1], 0, stream=stream)
+        comm.send(send[:1], 0, stream=stream)
+    comm.group_end()
+    stream.synchronize()
+
+
 def _cat_ubatch_outputs(sorted_results: list) -> Any:
     if sorted_results and isinstance(sorted_results[0], tuple):
         return tuple(torch.cat(parts, dim=0) for parts in zip(*sorted_results))
@@ -151,6 +175,10 @@ class UBatchWrapper:
                 torch.cuda.Stream(device=device)
                 for _ in group.tknp_dbo_comms
             ]
+            if os.environ.get("VLLM_TKNP_DBO_WARMUP_P2P", "1") == "1":
+                for comm, stream in zip(group.tknp_dbo_comms, self.tknp_comm_streams):
+                    _warmup_tknp_cohort_p2p(comm, stream)
+                logger.info("TKNP_UBATCH_P2P_WARMUP cohorts=%d", len(group.tknp_dbo_comms))
             logger.info("TKNP_UBATCH_INDEPENDENT_COMM cohorts=%d", len(group.tknp_dbo_comms))
         if (
             vllm_config.parallel_config.enable_token_parallel
@@ -177,6 +205,22 @@ class UBatchWrapper:
                 tp_group.device_communicator.tknp_dbo_tp_comms = comms
                 logger.info("TKNP_UBATCH_INDEPENDENT_TP cohorts=%d", len(comms))
                 dc = tp_group.device_communicator
+                if (dc.ca_comm is not None and not dc.ca_comm.disabled
+                        and os.environ.get("VLLM_TKNP_DBO_INDEPENDENT_TP_CUSTOM", "0") == "1"):
+                    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+
+                    # H100 native TP prefers custom all-reduce for small
+                    # tensors. Retain that priority without sharing its
+                    # handshake/scratch across concurrent cohort streams.
+                    private_max=int(os.environ.get("VLLM_TKNP_DBO_PRIVATE_TP_MAX_BYTES", "0"))
+                    if private_max and not 256*1024<=private_max<=8*1024**2:
+                        raise ValueError("Private custom TP override must be 256 KiB through 8 MiB")
+                    private_ca = [CustomAllreduce(tp_group.cpu_group, device,
+                        max_size=private_max or dc.ca_comm.max_size) for _ in comms]
+                    if any(comm.disabled for comm in private_ca):
+                        raise RuntimeError("Private TKNP custom TP buffers unavailable")
+                    dc.tknp_dbo_tp_ca_comms = private_ca
+                    logger.info("TKNP_UBATCH_INDEPENDENT_TP_CUSTOM cohorts=%d", len(private_ca))
                 if (
                     dc.symm_mem_comm is not None
                     and not dc.symm_mem_comm.disabled
@@ -368,6 +412,9 @@ class UBatchWrapper:
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         @torch.inference_mode()
         def _ubatch_thread(results, model, ubatch_metadata):
+            # CUDA's current device is thread-local. Select it before the
+            # context's stream helper can create a stream on default GPU 0.
+            torch.cuda.set_device(self.device)
             with ubatch_metadata.context:
                 model_output = model(
                     input_ids=ubatch_metadata.input_ids,
@@ -480,7 +527,17 @@ class UBatchWrapper:
                     # Keep a fixed padded shape for the compiled attention op.
                     # Its implementation skips all KV access for zero actual
                     # tokens; the gather uses the real zero transfer count.
-                    position_slice = slice(0, 1)
+                    # A multi-layout compiled root must not specialize the
+                    # same dense microbatch size once with C0's N positions
+                    # and once with C1's singleton placeholder. Borrow the
+                    # root's persistent local-position view for empty work.
+                    # Actual C1 attention remains ZERO: the opaque attention
+                    # and scatter/gather ops consult local_num_tokens=0 and
+                    # never read KV or transfer these compiler-padding rows.
+                    from vllm.v1.worker.tknp_serving_slots import empty_root_position_rows
+                    padding = (empty_root_position_rows(part.local_num_tokens for part in tknp_metadata)
+                               if os.environ.get("VLLM_TKNP_CAPTURE_LAYOUTS") else 1)
+                    position_slice = slice(0, padding)
                 local_token_start = local_token_stop
             (
                 sliced_input_ids,

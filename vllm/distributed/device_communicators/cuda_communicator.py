@@ -130,6 +130,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             if dbo_enabled():
                 cohort = dbo_current_ubatch_id()
+                custom_comms = getattr(self, "tknp_dbo_tp_ca_comms", None)
+                if custom_comms is not None:
+                    custom_comm = custom_comms[cohort]
+                    if not custom_comm.disabled and custom_comm.should_custom_ar(input_):
+                        out = custom_comm.custom_all_reduce(input_)
+                        if out is None:
+                            raise RuntimeError("TKNP cohort custom TP reduction failed")
+                        return out
                 symm_comms = getattr(self, "tknp_dbo_tp_symm_comms", None)
                 if symm_comms is not None:
                     symm_comm = symm_comms[cohort]
@@ -282,6 +290,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return tensor
 
     def destroy(self):
+        self.tknp_dbo_tp_ca_comms = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
         if self.ca_comm is not None:

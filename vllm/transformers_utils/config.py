@@ -92,6 +92,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     eagle="EAGLEConfig",
     speculators="SpeculatorsConfig",
     nemotron="NemotronConfig",
+    **{"nemotron-nas": "NemotronNASConfig"},
     olmo3="Olmo3Config",
     ovis="OvisConfig",
     ultravox="UltravoxConfig",

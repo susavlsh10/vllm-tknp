@@ -26,6 +26,31 @@ numerics = load("tknp_numerics_pure", ROOT / "examples/offline_inference/TKNP/di
 Request = placement.PlacementRequest
 
 
+def test_balanced_window_keeps_fifo_prefix_and_input_limits():
+    requests = [Request(str(i), n, 1) for i, n in enumerate([20, 80, 40, 100])]
+    free, limits, loads = [100, 100], [1, 1], [0, 0]
+    assigned = placement.place_balanced_window(
+        requests, free, 16, loads, request_limits=limits)
+    assert list(assigned) == ["0", "1"]
+    assert free == [100, 100] and limits == [1, 1] and loads == [0, 0]
+    assert [r.request_id for r in requests] == ["0", "1", "2", "3"]
+
+
+def test_balanced_window_does_not_skip_nonfitting_oldest_request():
+    assert placement.place_balanced_window(
+        [Request("old", 1000, 1), Request("new", 1, 1)], [1, 1], 16) == {}
+
+
+def test_balanced_window_root_bias_and_lifetime_reservations():
+    requests = [Request(str(i), n, 1) for i, n in enumerate([100, 80, 40, 20])]
+    assigned = placement.place_balanced_window(
+        requests, [20]*4, 16, request_limits=[1]*4, root_bias_tokens=100)
+    assert assigned["3"] == 0
+    for owner in range(4):
+        assert sum(r.blocks(16) for r in requests
+                   if assigned[r.request_id] == owner) <= 20
+
+
 def test_lifetime_blocks_and_fifo_capacity_queue():
     requests = [Request("large", 100, 29), Request("small", 1, 1)]
     assert requests[0].blocks(128) == 2

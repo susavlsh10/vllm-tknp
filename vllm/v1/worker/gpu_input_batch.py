@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import cast
 
 import numpy as np
@@ -54,10 +55,22 @@ class CachedRequestState:
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
+    # Worker-side prompts are immutable (num_prompt_tokens is cached too).
+    # PP rotates distinct request sets through InputBatch every step. Avoid
+    # converting each 32K+ Python prompt into int32 on every re-insertion.
+    # Own the array, and release it with this request's cached state.
+    prompt_token_ids_np: np.ndarray | None = field(
+        init=False, default=None, repr=False, compare=False
+    )
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
         )
+        if (self.prompt_token_ids is not None
+                and os.environ.get("VLLM_CACHE_PROMPT_TOKEN_IDS", "1") != "0"):
+            self.prompt_token_ids_np = np.array(self.prompt_token_ids, dtype=np.int32)
+            self.prompt_token_ids_np.flags.writeable = False
 
         if self.pooling_params is not None:
             self.pooling_states = PoolingStates()
@@ -331,7 +344,11 @@ class InputBatch:
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
         if request.prompt_token_ids is not None:
-            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
+            prompt = (request.prompt_token_ids_np
+                      if request.prompt_token_ids_np is not None
+                      and os.environ.get("VLLM_CACHE_PROMPT_TOKEN_IDS", "1") != "0"
+                      else request.prompt_token_ids)
+            self.token_ids_cpu[req_index, :num_prompt_tokens] = prompt
             self.is_token_ids[req_index, :num_prompt_tokens] = True
         else:
             self.is_token_ids[req_index, :num_prompt_tokens] = False

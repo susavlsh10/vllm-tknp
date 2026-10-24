@@ -297,6 +297,16 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
+        # Captured DCP kernels retain the context-length tensor's address.
+        # Arithmetic below creates a fresh tensor on every metadata build;
+        # replay must read an updated stable buffer, not the temporary used
+        # while capturing another batch shape.
+        self.dcp_context_kv_lens_buffer = None
+        if self.use_full_cuda_graph and self.dcp_world_size > 1:
+            self.dcp_context_kv_lens_buffer = torch.zeros(
+                vllm_config.scheduler_config.max_num_seqs,
+                dtype=torch.int32, device=self.device)
+
         if self.use_full_cuda_graph and self.aot_schedule:
             self.scheduler_metadata = torch.zeros(
                 vllm_config.scheduler_config.max_num_seqs + 1,
@@ -403,7 +413,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         if self.dcp_world_size > 1:
             query_kv_lens = query_start_loc[1:] - query_start_loc[:-1]
-            dcp_context_kv_lens = seq_lens - query_kv_lens
+            # Graph padding has seq_len=0 but a one-token query lane.
+            # Negative context would map to -1 on the last DCP rank and
+            # make the paged FA3 kernel read outside its block table.
+            dcp_context_kv_lens = (seq_lens - query_kv_lens).clamp_min_(0)
 
             dcp_context_kv_lens = get_dcp_local_seq_lens(
                 dcp_context_kv_lens,
@@ -411,6 +424,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
+            if self.use_full_cuda_graph:
+                buffer = self.dcp_context_kv_lens_buffer
+                assert buffer is not None and num_reqs <= buffer.numel()
+                buffer[:num_reqs].copy_(dcp_context_kv_lens)
+                buffer[num_reqs:].zero_()
+                dcp_context_kv_lens = buffer[:num_reqs]
             # After DCP distribution, the maximum number of tokens for any rank is
             # ceil(L / (N * I)) * I, where L is max_seq_len, N is dcp_world_size,
             # and I is cp_kv_cache_interleave_size.
@@ -792,6 +811,10 @@ class FlashAttentionImpl(AttentionImpl):
             softcap=self.logits_soft_cap,
             return_softmax_lse=True,
             scheduler_metadata=attn_metadata.scheduler_metadata,
+            # Must match the AOT schedule built for full CUDA graphs. The
+            # default heuristic split count can require a different metadata
+            # size (and its launch geometry can change with context length).
+            num_splits=attn_metadata.max_num_splits,
             fa_version=self.vllm_flash_attn_version,
             q_descale=q_descale,
             k_descale=k_descale,
@@ -806,8 +829,26 @@ class FlashAttentionImpl(AttentionImpl):
         )
         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
 
+        # Attention.forward quantizes Q when FA3 uses FP8 KV. The historical
+        # cache above is FP8, but the current-token K/V inputs below still have
+        # the model dtype. FA requires matching Q/K/V dtypes in each call.
+        # Recover Q's model-dtype values for this uncached contribution only;
+        # keep history attention and cache storage in FP8. Q quantization uses
+        # a per-tensor scale (expanded to [batch, kv_heads] by the caller).
+        current_query = query
+        current_q_descale = q_descale
+        current_k_descale = k_descale
+        current_v_descale = v_descale
+        if query.dtype != key.dtype:
+            if query.dtype != torch.float8_e4m3fn or q_descale is None:
+                raise ValueError("DCP current-token attention requires a scaled FP8 query")
+            current_query = query.to(key.dtype) * q_descale.reshape(-1)[0]
+            current_q_descale = None
+            current_k_descale = None
+            current_v_descale = None
+
         query_attn_out, query_lse = flash_attn_varlen_func(
-            q=query,
+            q=current_query,
             k=key,
             v=value,
             out=None,
@@ -822,9 +863,9 @@ class FlashAttentionImpl(AttentionImpl):
             softcap=self.logits_soft_cap,
             return_softmax_lse=True,
             fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
+            q_descale=current_q_descale,
+            k_descale=current_k_descale,
+            v_descale=current_v_descale,
         )
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape

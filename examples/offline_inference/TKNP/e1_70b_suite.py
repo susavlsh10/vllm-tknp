@@ -27,7 +27,7 @@ def topology(method, count):
     if method in {"tknp", "tknp-dbo"}:
         return 1, 1, count, 1, 1
     if method.startswith("tknp-tp"):
-        tp = int(method.removeprefix("tknp-tp"))
+        tp = int(method.removeprefix("tknp-tp").removesuffix("-dbo"))
         return tp, 1, count // tp, 1, 1
     if method in {"dp-native", "dp-lifetime"}:
         return 1, 1, 1, 1, count
@@ -46,9 +46,26 @@ def topology(method, count):
         return tp, pp, 1, 1, 1
     if method == "dcp":
         if count < 16:
-            raise ValueError("70B DCP requires TP>8 KV heads: minimum TP16+DCP2 (four nodes)")
+            raise ValueError("70B DCP requires TP>8 KV heads: minimum TP16+DCP2 (16 GPUs)")
         return count, 1, 1, count // 8, 1
     raise ValueError((method, count))
+
+
+def validate_paper_plan(methods, decoder_count, family, prefill_tp):
+    """Keep historical low-TP results readable, but never collect them anew."""
+    if family == "e2e" and prefill_tp != 8:
+        raise ValueError("Llama paper collection requires TP8 prefill")
+    for method in methods:
+        tp, pp, tk, dcp, replicas = topology(method, decoder_count)
+        if tp * pp * tk * replicas != decoder_count:
+            raise ValueError("Topology does not consume the complete decode GPU budget")
+        if method == "dcp":
+            if family != "decode":
+                raise ValueError("DCP real KV handoff is unsupported; use the labeled decode-only family")
+        elif tp != 8 or pp not in (1, 2) or pp == 2 and tk * replicas != 1:
+            raise ValueError("Paper collection requires TP8 first and at most the TP8xPP2 baseline")
+        if method.startswith("tknp") and tk < 2:
+            raise ValueError("Token parallel collection requires at least two TP8 groups")
 
 
 def quotas(caps, offered):
@@ -121,13 +138,16 @@ def tknp_capacity_rebalance_needed(trial, actual, offered):
     return achievable > usable
 
 
-def build_trial(method, context, tokens, offered, decoder_gpus, caps, family, prefill_gpus=None):
+def build_trial(method, context, tokens, offered, decoder_gpus, caps, family, prefill_gpus=None, prefill_tp=1):
     tp, pp, tk, dcp, replicas = topology(method, len(decoder_gpus))
     servers = []
     if family == "e2e":
-        servers.extend(dict(role="prefill", gpus=[gpu], connector="nixl",
-                            kv_cache_memory_bytes=32 * GIB,
-                            env={"VLLM_TKNP_LIFETIME_ADMISSION": "1"}) for gpu in (prefill_gpus or [0]))
+        pool = prefill_gpus or [0]
+        if len(pool) % prefill_tp:
+            raise ValueError("Prefill GPU pool must contain complete TP groups")
+        servers.extend(dict(role="prefill", tp=prefill_tp, gpus=pool[i:i+prefill_tp], connector="nixl",
+                            env={"VLLM_TKNP_LIFETIME_ADMISSION": "1"})
+                       for i in range(0, len(pool), prefill_tp))
     if method == "dcp" and family == "e2e":
         raise ValueError("Real KV handoff to DCP is unsupported; never relabel synthetic KV")
     for replica in range(replicas):
@@ -161,7 +181,13 @@ def build_trial(method, context, tokens, offered, decoder_gpus, caps, family, pr
                       graph_batch_size=lanes, max_num_seqs=lanes, env=env)
         if tk > 1:
             server.update(placement="cost", graph_slots=True, owner_counts=owner_counts,
-                          enable_dbo=method == "tknp-dbo")
+                          enable_dbo=method.endswith("-dbo"))
+            if method.endswith("-dbo"):
+                env.update(VLLM_TKNP_DBO_ZERO_ROOT_C1="1", VLLM_TKNP_DBO_INDEPENDENT_COMM="1",
+                    VLLM_TKNP_DBO_ROOT_SPLIT_COMPUTE="1", VLLM_TKNP_DBO_INDEPENDENT_TP="1",
+                    VLLM_TKNP_DBO_LAYOUT="asymmetric", VLLM_TKNP_DBO_LOOKAHEAD="1",
+                    VLLM_TKNP_DBO_SYMM_MEM="0", VLLM_TKNP_DBO_C0_FRACTION="0.5",
+                    VLLM_TKNP_DBO_ROOT_REQUESTS=str(owner_counts[0]))
         if pp > 1:
             microbatch = max(1, math.ceil(lanes / pp))
             server.update(pp_decode_microbatch=microbatch, graph_batch_size=microbatch)
@@ -190,12 +216,16 @@ def measured_caps(path, context, tokens, trial):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--runtime-json", type=Path, help="Explicit container/Python paths; EOS readiness matrix runtime object")
+    parser.add_argument("--gpus-per-node", type=int, default=4)
+    parser.add_argument("--prefill-tp", type=int, default=8)
     parser.add_argument("--job", required=True)
     parser.add_argument("--nodes", nargs="+", required=True)
     parser.add_argument("--decoder-gpus", type=int, nargs="+", required=True)
-    parser.add_argument("--prefill-gpus", type=int, nargs="+", default=[0])
+    parser.add_argument("--prefill-gpus", type=int, nargs="+", default=list(range(8)))
     parser.add_argument("--contexts", type=int, nargs="+", default=[32768, 65536, 98304])
-    parser.add_argument("--methods", nargs="+", default=["tknp", "dp-native", "dp-lifetime", "tp", "pp"])
+    parser.add_argument("--methods", nargs="+")
     parser.add_argument("--family", choices=["e2e", "decode"], default="e2e")
     parser.add_argument("--tokens", type=int, default=1025)
     parser.add_argument("--batches", type=int, nargs="+", help="Otherwise capacity-driven three-point sweep")
@@ -210,18 +240,25 @@ def main():
     parser.add_argument("--repeats", type=int, default=1,
                         help="Matched unprofiled repeats; reverse configuration order on alternate pairs")
     args = parser.parse_args()
+    if args.methods is None:
+        args.methods = ["tknp-tp8", "dp-tp8", "tp8-pp2"] + (["dcp"] if args.family == "decode" else [])
+    validate_paper_plan(args.methods, len(args.decoder_gpus), args.family, args.prefill_tp)
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
-    config = dict(model=MODEL, load_format="dummy", kv_cache_dtype="auto", require_bf16=True,
+    config = dict(model=args.model, load_format="dummy", kv_cache_dtype="auto", require_bf16=True,
                   max_num_seqs=128, max_num_batched_tokens=1024,
                   gpu_memory_utilization=args.gpu_memory_utilization, warmup_requests=0, routing="least-work", timeout=args.request_timeout,
                   slurm_job_id=args.job, slurm_nodes=args.nodes,
+                  gpus_per_node=args.gpus_per_node,
+                  decoder_gpus=args.decoder_gpus,
                   cache_root=str(args.output.parent / "shared_cache"),
                   triton_root=str(args.output.parent / "shared_triton"),
                   scope=("70B BF16 architecture proxy, dummy weights; " +
                          ("real model-computed BF16 KV and NIXL P/D transfer" if args.family == "e2e" else
                           "synthetic BF16 KV decode-only control; NO prefill/transfer measurement")))
+    if args.runtime_json:
+        config["runtime"] = json.loads(args.runtime_json.read_text())
     status_path = args.output / "suite.json"
     state = json.loads(status_path.read_text()) if status_path.exists() else {"config": config, "attempts": []}
     state["config"] = config
@@ -250,10 +287,10 @@ def main():
         workload = args.output / f"workload-c{context}-b{offered}-o{tokens}.jsonl"
         if not workload.exists():
             command = [sys.executable, str(HERE / "e2e_workload.py"), "generate", "--natural",
-                       "--tokenizer", MODEL, "--output", str(workload), "--count", str(offered),
+                       "--tokenizer", args.model, "--output", str(workload), "--count", str(offered),
                        "--lengths", str(context), "--output-lengths", str(tokens)]
             subprocess.run(client_command(config, command), check=True, timeout=120)
-        validate_matrix(dict(config, trials=[trial]), len(args.nodes) * 4)
+        validate_matrix(dict(config, trials=[trial]), len(args.nodes) * args.gpus_per_node)
         (args.output / (trial["name"] + "-config.json")).write_text(json.dumps(dict(config, trials=[trial]), indent=2) + "\n")
         row = dict(name=trial["name"], status="running", context=context, tokens=tokens, offered=offered,
                    workload_sha256=hashlib.sha256(workload.read_bytes()).hexdigest(), start_time=time.time())
@@ -304,8 +341,14 @@ def main():
                 persist()
                 continue
             probe_count = max(8, tk, replicas)
+            probe_caps = [1 if tk > 1 else 8] * tk * replicas
+            if method.endswith("-dbo"):
+                # Keep both cohorts away from changing singleton position
+                # shapes while exercising the real pipelined schedule.
+                probe_count = 8 if tk == 2 else 8 * tk
+                probe_caps = [2, 6] if tk == 2 else [8] * tk
             trial = build_trial(method, context, args.tokens, probe_count, args.decoder_gpus,
-                                [1 if tk > 1 else 8] * tk * replicas, args.family, args.prefill_gpus)
+                                probe_caps, args.family, args.prefill_gpus, args.prefill_tp)
             trial["name"] = f"probe-{args.family}-c{context}-{method}"
             row = execute(trial, context, 17, probe_count)
             if row["status"] == "completed":
@@ -317,7 +360,8 @@ def main():
         if not capacities:
             continue
         tk_capacity = best_tknp_capacity(capacities, len(args.decoder_gpus))
-        dp_capacity = sum(capacities.get("dp-lifetime", capacities.get("dp-native", [max(1, tk_capacity // 3)])))
+        dp_capacity = sum(capacities.get("dp-tp8", capacities.get("dp-lifetime",
+            capacities.get("dp-native", [max(1, tk_capacity // 3)]))))
         regime_batches = dict(below=max(1, dp_capacity), crossover=max(1, tk_capacity),
                               overload=max(tk_capacity + 2, math.ceil(tk_capacity * 1.25)))
         batches = args.batches or sorted({regime_batches[r] for r in args.regimes})
@@ -333,7 +377,7 @@ def main():
                     methods.reverse()
                 for method in methods:
                     trial = build_trial(method, context, args.tokens, offered,
-                                        args.decoder_gpus, capacities[method], args.family, args.prefill_gpus)
+                                        args.decoder_gpus, capacities[method], args.family, args.prefill_gpus, args.prefill_tp)
                     if repeat_index:
                         trial["name"] += f"-repeat{repeat_index}"
                     row = execute(trial, context, args.tokens, offered)
@@ -354,7 +398,7 @@ def main():
                             original_servers=trial["servers"])
                         capacities[method] = actual
                         trial = build_trial(method, context, args.tokens, offered,
-                                            args.decoder_gpus, actual, args.family, args.prefill_gpus)
+                                            args.decoder_gpus, actual, args.family, args.prefill_gpus, args.prefill_tp)
                         if repeat_index:
                             trial["name"] += f"-repeat{repeat_index}"
                         trial["name"] += "-capacity-recalibrated"

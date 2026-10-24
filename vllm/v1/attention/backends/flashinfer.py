@@ -3,6 +3,7 @@
 """Attention layer with FlashInfer."""
 
 from dataclasses import dataclass
+import os
 from typing import ClassVar
 
 import numpy as np
@@ -63,6 +64,23 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.utils import CpuGpuBuffer
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
+
+
+def decode_uses_tensor_cores(num_q_heads, num_kv_heads, *, is_hopper,
+                            batch_invariant=False, override=None):
+    """Keep legacy defaults except the validated Hopper GQA4 decode case.
+
+    Blackwell uses its existing path. Other GQA ratios and invariant fixed
+    splitting retain tensor cores until separately measured. The explicit
+    override supports reproducible A/B and reverting this choice.
+    """
+    policy = override if override is not None else os.environ.get(
+        "VLLM_FLASHINFER_DECODE_USE_TENSOR_CORES", "auto")
+    if policy not in ("0", "1", "auto"):
+        raise ValueError("VLLM_FLASHINFER_DECODE_USE_TENSOR_CORES must be auto, 0 or 1")
+    if policy != "auto":
+        return policy == "1"
+    return not (is_hopper and not batch_invariant and num_q_heads == 4*num_kv_heads)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
@@ -701,6 +719,44 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr = None
                 paged_kv_indices = None
                 paged_kv_last_page_len = None
+            tensor_cores = decode_uses_tensor_cores(
+                self.num_qo_heads * self.dcp_world_size, self.num_kv_heads,
+                is_hopper=current_platform.is_device_capability_family(90),
+                batch_invariant=vllm_is_batch_invariant())
+            from vllm.v1.attention.ops.grouped_decode import (
+                QueryGroupedDecodeWrapper, query_group_count)
+            groups = query_group_count(
+                self.num_qo_heads*self.dcp_world_size,self.num_kv_heads,
+                is_hopper=current_platform.is_device_capability_family(90),
+                batch_invariant=vllm_is_batch_invariant())
+            if groups > 1:
+                decode_wrapper = QueryGroupedDecodeWrapper(
+                    self._get_workspace_buffer(),get_kv_cache_layout(),
+                    batch_size=batch_size,
+                    max_requests=self.vllm_config.scheduler_config.max_num_seqs,
+                    max_page_indices=self.paged_kv_indices.gpu.numel(),
+                    max_pages_per_request=cdiv(self.model_config.max_model_len,
+                        self.page_size*self.dcp_world_size)+1,
+                    use_cuda_graph=use_cudagraph)
+                if use_cudagraph:
+                    self._decode_wrappers_cudagraph[batch_size] = decode_wrapper
+                else:
+                    self._decode_wrapper = decode_wrapper
+                return decode_wrapper
+            fixed_cc_graph = use_cudagraph and not tensor_cores
+            if fixed_cc_graph:
+                from vllm.v1.attention.ops.fixed_decode_plan import require_fixed_decode_abi
+                try:
+                    require_fixed_decode_abi()
+                    if self.head_dim!=128:
+                        raise RuntimeError("Fixed CC graph validated only for head dimension 128")
+                except RuntimeError:
+                    if os.environ.get("VLLM_FLASHINFER_DECODE_USE_TENSOR_CORES","auto")!="auto":
+                        raise
+                    # Never silently record a length-specialized CC launch on
+                    # an unvalidated ABI. The original TC path remains safe.
+                    tensor_cores=True
+                    fixed_cc_graph=False
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_kv_cache_layout(),
@@ -708,11 +764,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr_buffer=paged_kv_indptr,
                 paged_kv_indices_buffer=paged_kv_indices,
                 paged_kv_last_page_len_buffer=paged_kv_last_page_len,
-                # Tensor cores are enabled by default because the perf would be
-                # at least as good as cuda cores for all attention ops in latest
-                # gpus.
-                use_tensor_cores=True,
+                # Hopper GQA4 single-token decode is bandwidth-bound; the
+                # generic tensor-core prefill kernel is substantially slower.
+                use_tensor_cores=tensor_cores,
             )
+            if fixed_cc_graph:
+                from vllm.v1.attention.ops.fixed_decode_plan import choose_fixed_chunk_pages
+                max_pages=cdiv(self.model_config.max_model_len,self.page_size*self.dcp_world_size)+1
+                decode_wrapper._vllm_fixed_cc_max_pages=max_pages
+                decode_wrapper._vllm_fixed_cc_chunk_pages=choose_fixed_chunk_pages(
+                    batch_size,self.num_kv_heads,max_pages,
+                    torch.cuda.get_device_properties(self.device).multi_processor_count)
 
             # save the decode wrapper
             if use_cudagraph:
@@ -1595,6 +1657,19 @@ def fast_plan_decode(
     Part of the code get inspiration from the original plan from FlashInfer repo
     and the implementation of fast_decode_plan for FlashInfer in SGlang repo.
     """
+    # vLLM historically uses -1 for "no fixed split". FlashInfer's public API
+    # uses None; passing -1 explicitly rejects the CUDA-core decode backend.
+    # Tensor-core planning converts None back to its internal -1 sentinel.
+    if fixed_split_size == -1:
+        fixed_split_size = None
+    if hasattr(self,"plan_grouped"):
+        return self.plan_grouped(indptr_cpu,indices,last_page_len_cpu,seq_lens_cpu,
+            num_qo_heads,num_kv_heads,head_dim,page_size,
+            pos_encoding_mode=pos_encoding_mode,window_left=window_left,
+            logits_soft_cap=logits_soft_cap,q_data_type=q_data_type,
+            kv_data_type=kv_data_type,data_type=data_type,sm_scale=sm_scale,
+            rope_scale=rope_scale,rope_theta=rope_theta,non_blocking=non_blocking,
+            fixed_split_size=fixed_split_size,disable_split_kv=disable_split_kv)
     # Warm up with the original plan if it is first call, and always run the
     # original plan if we run for dynamic shape. For fixed shape (cudagraph),
     # this warm up is to generate the _cached_module for the decode wrapper.
@@ -1624,6 +1699,14 @@ def fast_plan_decode(
             disable_split_kv,
         )
         self.vllm_first_call = False
+        if not getattr(self,"_vllm_fixed_cc_max_pages",None):
+            return
+
+    if getattr(self,"_vllm_fixed_cc_max_pages",None):
+        from vllm.v1.attention.ops.fixed_decode_plan import fixed_split_decode_plan
+        fixed_split_decode_plan(self,indptr_cpu,indices,last_page_len_cpu,
+            num_qo_heads,head_dim,page_size,self._vllm_fixed_cc_chunk_pages,
+            self._vllm_fixed_cc_max_pages)
         return
 
     assert self.is_cuda_graph_enabled, "Should be cudagraph only here"

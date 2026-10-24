@@ -12,10 +12,12 @@ from vllm.model_executor.layers.token_parallel_linear import (
 
 
 def main():
-    rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(rank)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
     dist.init_process_group("gloo")
-    device = torch.device("cuda", rank)
+    rank = dist.get_rank()
+    assert dist.get_world_size() == 4, "Use exactly four ranks (one or two nodes)"
+    device = torch.device("cuda", local_rank)
     comms = [PyNcclCommunicator(dist.group.WORLD, device=device) for _ in range(2)]
     assert all(comm.available for comm in comms)
     counts = [[4, 3, 3, 2], [0, 4, 4, 4]]

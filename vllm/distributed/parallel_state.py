@@ -29,7 +29,7 @@ import pickle
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
@@ -457,7 +457,7 @@ class GroupCoordinator:
 
         # only cuda uses this function,
         # so we don't abstract it into the base class
-        maybe_ca_context = nullcontext()
+        capture_comms = []
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
@@ -466,7 +466,9 @@ class GroupCoordinator:
             assert isinstance(self.device_communicator, CudaCommunicator)
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture()  # type: ignore
+                capture_comms.append(ca_comm)
+            capture_comms.extend(getattr(self.device_communicator,
+                "tknp_dbo_tp_ca_comms", None) or [])
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -474,7 +476,9 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
+        with torch.cuda.stream(stream), ExitStack() as contexts:
+            for comm in capture_comms:
+                contexts.enter_context(comm.capture())
             yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:

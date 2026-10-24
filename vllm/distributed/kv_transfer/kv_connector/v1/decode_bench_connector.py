@@ -56,6 +56,39 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def initialize_research_kv(cache, *, cache_dtype, mean, std, seed):
+    """Fill real pages once; FP8 byte storage contains encoded finite E4M3.
+
+    Random raw bytes are NOT random FP8 values (they can encode NaNs).
+    Physical order is immaterial for this synthetic, explicitly non-prefill KV.
+    """
+    generator = torch.Generator(device=cache.device).manual_seed(seed)
+    if cache.dtype == torch.bfloat16:
+        if std > 0:
+            cache.normal_(mean, std, generator=generator)
+        else:
+            cache.fill_(mean)
+        return
+    if cache_dtype not in ("fp8", "fp8_e4m3") or cache.dtype not in (
+            torch.uint8, torch.float8_e4m3fn):
+        raise ValueError("Research KV supports BF16 or explicitly encoded E4M3 FP8")
+    # Permuted contiguous layouts are supported without making a detached copy.
+    order = sorted(range(cache.ndim), key=lambda axis: cache.stride(axis), reverse=True)
+    physical = cache.permute(order)
+    if not physical.is_contiguous():
+        raise ValueError("FP8 research KV requires a dense physical allocation")
+    flat = physical.view(-1)
+    for begin in range(0, flat.numel(), 8*1024*1024):
+        count = min(8*1024*1024, flat.numel()-begin)
+        values = torch.empty(count, dtype=torch.float16, device=cache.device)
+        if std > 0:
+            values.normal_(mean, std, generator=generator)
+        else:
+            values.fill_(mean)
+        encoded = values.clamp(-448,448).to(torch.float8_e4m3fn)
+        flat[begin:begin+count].copy_(encoded.view(torch.uint8) if cache.dtype == torch.uint8 else encoded)
+
+
 @dataclass
 class DecodeBenchConnectorMetadata(KVConnectorMetadata):
     """Metadata for DecodeBenchConnector.
@@ -73,12 +106,17 @@ class DecodeBenchConnectorMetadata(KVConnectorMetadata):
 
 class DecodeBenchConnector(KVConnectorBase_V1):
     """
+
     A KV Connector for decode instance performance testing.
 
     This connector fills the KV cache with dummy (non-zero) values to
     emulate a prefill-decode disaggregated setting, enabling performance
     testing of the decoder with larger input sequence lengths.
     """
+
+    # build_connector_meta consumes only allocation/fill state, never the
+    # SchedulerOutput's full token-history copies for rotated cached requests.
+    requires_cached_request_token_ids = False
 
     def __init__(
         self,
@@ -295,6 +333,15 @@ class DecodeBenchConnectorWorker:
         assert kv_transfer_config is not None
         self.fill_mean = kv_transfer_config.get_from_extra_config("fill_mean", 0.015)
         self.fill_std = kv_transfer_config.get_from_extra_config("fill_std", 0.0)
+        self.preinitialize_pool = kv_transfer_config.get_from_extra_config("preinitialize_pool", False)
+        self.fill_seed = kv_transfer_config.get_from_extra_config("fill_seed", 20261016)
+        self.preinitialized_bytes = 0
+        self.preinitialized_layers = 0
+        self.per_request_fill_calls = 0
+        self.kv_block_axis = kv_transfer_config.get_from_extra_config("kv_block_axis",None)
+        if self.kv_block_axis not in (None,0,1):
+            raise ValueError("kv_block_axis must be 0 or 1")
+        self.kv_block_axes: dict[str,int] = {}
 
         # Will be populated via register_kv_caches
         self.kv_caches: dict[str, torch.Tensor] | None = None
@@ -305,11 +352,34 @@ class DecodeBenchConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Store references to the KV cache tensors and build group mapping."""
         self.kv_caches = kv_caches
+        for name,cache in kv_caches.items():
+            if self.kv_block_axis is not None:
+                axis=self.kv_block_axis
+            elif cache.ndim==5 and cache.shape[0]==2 and cache.shape[1]==2:
+                raise ValueError("Ambiguous two-block KV layout: configure kv_block_axis")
+            elif cache.ndim==5 and cache.shape[0]==2:
+                # FlashAttention/standard Triton: [2,blocks,page,heads,dim].
+                axis=1
+            else:
+                # FlashInfer: [blocks,2,...], or block-major MLA.
+                axis=0
+            self.kv_block_axes[name]=axis
 
         # For simplicity, assume all layers belong to group 0 (standard attention)
         # For MLA models with multiple groups, the metadata will handle the mapping
         # We just need to fill the blocks specified in the metadata
         self.group_to_layers = {0: list(kv_caches.keys())}
+        if self.preinitialize_pool:
+            # Real physical pages, initialized once before accepting requests.
+            # Normal page ownership, capacity admission and decode writes remain.
+            with torch.no_grad():
+                for index, cache in enumerate(kv_caches.values()):
+                    initialize_research_kv(cache,
+                        cache_dtype=getattr(self.vllm_config.cache_config,"cache_dtype","auto"),
+                        mean=self.fill_mean, std=self.fill_std, seed=self.fill_seed+index)
+                    self.preinitialized_bytes += cache.numel() * cache.element_size()
+                    self.preinitialized_layers += 1
+            torch.cuda.synchronize()
 
         logger.debug(
             "DecodeBenchConnector: Registered %d KV cache layers",
@@ -329,6 +399,10 @@ class DecodeBenchConnectorWorker:
             return
 
         assert self.kv_caches is not None, "KV caches must be registered before filling"
+        if self.preinitialize_pool:
+            assert self.preinitialized_layers == len(self.kv_caches)
+            return
+        self.per_request_fill_calls += len(metadata.reqs_to_fill)
         assert self.group_to_layers is not None, "Group mapping must be initialized"
 
         for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
@@ -372,6 +446,7 @@ class DecodeBenchConnectorWorker:
                 continue
 
             kv_cache = self.kv_caches[layer_name]
+            block_axis=self.kv_block_axes[layer_name]
 
             # Convert block_ids to tensor on device
             block_ids_tensor = torch.tensor(
@@ -379,34 +454,28 @@ class DecodeBenchConnectorWorker:
             )
 
             # Filter invalid block IDs
-            valid_mask = block_ids_tensor < kv_cache.shape[0]
+            valid_mask = (block_ids_tensor>=0)&(block_ids_tensor<kv_cache.shape[block_axis])
             valid_block_ids = block_ids_tensor[valid_mask]
 
             if len(valid_block_ids) == 0:
                 continue
 
             # Create fill values - either constant or random
-            block_shape = kv_cache.shape[1:]
             if self.fill_std > 0:
                 # Random normal sampling
+                shape=list(kv_cache.shape)
+                shape[block_axis]=len(valid_block_ids)
                 fill_values = torch.normal(
                     mean=self.fill_mean,
                     std=self.fill_std,
-                    size=(len(valid_block_ids),) + block_shape,
+                    size=tuple(shape),
                     dtype=kv_cache.dtype,
                     device=kv_cache.device,
                 )
+                kv_cache.index_copy_(block_axis,valid_block_ids,fill_values)
             else:
                 # Constant fill value
-                fill_values = torch.full(
-                    (len(valid_block_ids),) + block_shape,
-                    self.fill_mean,
-                    dtype=kv_cache.dtype,
-                    device=kv_cache.device,
-                )
-
-            # Batch fill operation
-            kv_cache[valid_block_ids] = fill_values
+                kv_cache.index_fill_(block_axis,valid_block_ids,self.fill_mean)
 
         logger.debug(
             "DecodeBenchConnector: Filled %d blocks in group %d with %s values "

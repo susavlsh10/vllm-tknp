@@ -685,7 +685,7 @@ class GPUModelRunner(
             request_to_rank.append(req_rank)
             rank_request_indices[req_rank].append(req_idx)
 
-        graph_slots = int(os.environ.get("VLLM_TKNP_GRAPH_SLOTS", "0"))
+        graph_slots = self._tknp_serving_graph_size()
         if graph_slots:
             from vllm.v1.worker.tknp_serving_slots import plan_slots
             counts = self._tknp_graph_splits[graph_slots]
@@ -695,8 +695,8 @@ class GPUModelRunner(
             self._tknp_runtime_slot_plan = plan_slots(request_to_rank, layout, rank)
             source = self.input_ids.gpu[:self.input_batch.num_reqs].clone()
             self.input_ids.gpu[:graph_slots].zero_()
-            indices = torch.tensor(self._tknp_runtime_slot_plan.request_slots,
-                                   dtype=torch.long, device=self.device)
+            indices = self._tknp_cached_index_tensor(
+                "input_graph_slots",self._tknp_runtime_slot_plan.request_slots,torch.long)
             self.input_ids.gpu.index_copy_(0, indices, source)
             request_to_rank = layout
             tokens_per_rank = counts
@@ -983,11 +983,8 @@ class GPUModelRunner(
             if global_logit_idx in global_to_local_token:
                 local_logits_list.append(global_to_local_token[global_logit_idx])
         
-        local_logits_indices = torch.tensor(
-            local_logits_list, 
-            dtype=logits_indices.dtype, 
-            device=logits_indices.device
-        )
+        local_logits_indices = self._tknp_cached_index_tensor(
+            "local_logits_indices", local_logits_list, logits_indices.dtype)
         
         restore_state: dict[str, Any] = {
             "num_reqs": num_reqs,
@@ -1022,7 +1019,9 @@ class GPUModelRunner(
             blk_table = self.input_batch.block_table[kv_cache_gid]
             # Get the current slot mapping and slice it
             global_slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded].clone()
-            local_slot_mapping = global_slot_mapping[local_token_indices]
+            token_indices = self._tknp_cached_index_tensor(
+                "local_token_indices", local_token_indices, torch.long)
+            local_slot_mapping = global_slot_mapping.index_select(0, token_indices)
             blk_table.slot_mapping.gpu[:local_num_tokens].copy_(local_slot_mapping)
             restore_state["slot_mappings"].append((kv_cache_gid, global_slot_mapping))
             
@@ -1030,7 +1029,9 @@ class GPUModelRunner(
             # Note: block_table.get_device_tensor will be called later with local_num_reqs
             # We need to reorder the block table rows
             global_block_table = blk_table.get_device_tensor(num_reqs).clone()
-            local_block_table = global_block_table[local_req_indices]
+            req_indices = self._tknp_cached_index_tensor(
+                "local_req_indices", local_req_indices, torch.long)
+            local_block_table = global_block_table.index_select(0, req_indices)
             blk_table.get_device_tensor(local_num_reqs)[:local_num_reqs].copy_(local_block_table)
             restore_state["block_tables"].append((kv_cache_gid, global_block_table))
         
@@ -1069,10 +1070,28 @@ class GPUModelRunner(
         self.query_start_loc.np[:local_count + 1] = np.arange(local_count + 1)
         self.query_start_loc.np[local_count + 1:] = local_count
         self.query_start_loc.copy_to_gpu()
-        local_indices = torch.tensor([local for local, _ in actual_rows],
-                                     dtype=torch.long, device=self.device)
-        original_indices = torch.tensor([original for _, original in actual_rows],
-                                        dtype=torch.long, device=self.device)
+        if os.environ.get("VLLM_TKNP_VALIDATE_HETERO_METADATA", "0") == "1":
+            # Diagnostic only: synchronize to check the persistent graph inputs
+            # against each live request's computed-token count. Never enable
+            # this CPU readback in a throughput measurement.
+            expected = [0] * local_count
+            for local, original in actual_rows:
+                expected[local] = int(state["computed_tokens"][original]) + 1
+                if int(state["seq_lens"][original]) != expected[local]:
+                    raise RuntimeError("Heterogeneous request sequence metadata mismatch")
+            observed = self.seq_lens.gpu[:local_count].cpu().tolist()
+            if observed != expected:
+                raise RuntimeError("Persistent graph sequence lengths do not match request lengths")
+            if hasattr(self, "_research_execution_counts"):
+                self._research_execution_counts["hetero_metadata_checks"] += 1
+                if len(set(n for n in expected if n)) > 1:
+                    self._research_execution_counts["hetero_mixed_length_checks"] += 1
+                for n in set(expected):
+                    self._research_execution_counts[f"hetero_seen_seq_len:{n}"] += 1
+        local_indices = self._tknp_cached_index_tensor(
+            "attention_local_indices", [local for local, _ in actual_rows], torch.long)
+        original_indices = self._tknp_cached_index_tensor(
+            "attention_original_indices", [original for _, original in actual_rows], torch.long)
         for gid in range(len(self.kv_cache_config.kv_cache_groups)):
             table = self.input_batch.block_table[gid]
             original_slots = table.slot_mapping.gpu[:num_tokens].clone()
@@ -1088,7 +1107,7 @@ class GPUModelRunner(
                     0, local_indices, original_blocks.index_select(0, original_indices))
         scheduled = {self.input_batch.req_ids[original]: 1 for _, original in actual_rows}
         return (local_count, local_count, np.ones(local_count, dtype=np.int32), 1,
-                torch.arange(local_count, device=self.device, dtype=logits_indices.dtype),
+                self._tknp_cached_index_tensor("local_logits_indices", range(local_count), logits_indices.dtype),
                 scheduled, [original for _, original in actual_rows], state)
 
     def _restore_tknp_inputs(self, restore_state: dict[str, Any]) -> None:
@@ -1268,8 +1287,10 @@ class GPUModelRunner(
             local_positions = positions.new_zeros(padded)
             occupied = [(local, original) for local, original in enumerate(rows) if original is not None]
             if occupied:
-                targets = torch.tensor([local for local, _ in occupied], dtype=torch.long, device=self.device)
-                sources = torch.tensor([original for _, original in occupied], dtype=torch.long, device=self.device)
+                targets = self._tknp_cached_index_tensor(
+                    "attention_local_indices", [local for local, _ in occupied], torch.long)
+                sources = self._tknp_cached_index_tensor(
+                    "attention_original_indices", [original for _, original in occupied], torch.long)
                 local_positions.index_copy_(0, targets, positions.index_select(0, sources))
             return self._stage_tknp_positions(local_positions)
         req_ids = self.input_batch.req_ids
@@ -1289,9 +1310,32 @@ class GPUModelRunner(
             end_tok = cu_tokens[global_idx + 1]
             local_token_indices.extend(range(start_tok, end_tok))
         
-        local_positions = (positions[:, local_token_indices] if self.uses_mrope
-                           else positions[local_token_indices])
+        token_indices = self._tknp_cached_index_tensor(
+            "local_token_indices", local_token_indices, torch.long)
+        local_positions = positions.index_select(-1, token_indices)
         return self._stage_tknp_positions(local_positions)
+
+    def _tknp_cached_index_tensor(self, name, values, dtype):
+        """Reuse immutable device indices while the request/slot mapping is stable.
+
+        torch.tensor(Python_list, device='cuda') is a blocking host-to-device
+        copy. Decode used to do this several times per rank per token, even
+        when every index was unchanged. Keep one bounded entry per use site;
+        value, dtype or device changes replace it. Indices are never mutated,
+        so queued work can safely retain the previous entry after a switch.
+        """
+        if os.environ.get("VLLM_TKNP_CACHE_INDEX_TENSORS", "1") == "0":
+            return torch.tensor(values, dtype=dtype, device=self.device)
+        key = (tuple(int(value) for value in values), dtype, self.device)
+        cache = getattr(self, "_tknp_index_tensor_cache", None)
+        if cache is None:
+            cache = self._tknp_index_tensor_cache = {}
+        entry = cache.get(name)
+        if entry is None or entry[0] != key:
+            tensor = torch.tensor(key[0], dtype=dtype, device=self.device)
+            cache[name] = (key, tensor)
+            return tensor
+        return entry[1]
 
     def _stage_tknp_positions(self, positions: torch.Tensor) -> torch.Tensor:
         """Use the same rank-local rotary-position address in capture/replay.
@@ -1517,14 +1561,24 @@ class GPUModelRunner(
             1, math.ceil(request_tokens / self.cache_config.block_size)
         )
 
-        for n in self.cudagraph_batch_sizes:
+        capture_layouts = None
+        if os.environ.get("VLLM_TKNP_CAPTURE_LAYOUTS"):
+            import json
+            from vllm.v1.worker.tknp_serving_slots import normalize_capture_layouts
+            capture_layouts = normalize_capture_layouts(
+                json.loads(os.environ["VLLM_TKNP_CAPTURE_LAYOUTS"]), world_size)
+            if set(capture_layouts) != set(self.cudagraph_batch_sizes):
+                raise ValueError("Every configured TKNP capture size needs exactly one ownership layout")
             if os.environ.get("VLLM_TKNP_CAPTURE_OWNER_COUNTS"):
+                raise ValueError("Select per-size layouts OR a single capture owner vector")
+        for n in self.cudagraph_batch_sizes:
+            if capture_layouts is not None or os.environ.get("VLLM_TKNP_CAPTURE_OWNER_COUNTS"):
                 from vllm.v1.worker.tknp_serving_slots import fit_capture_split, validate_capture_split
                 import json
                 validate = (fit_capture_split if os.environ.get("VLLM_TKNP_CAPTURE_REBALANCE") == "1"
                             else validate_capture_split)
                 self._tknp_graph_splits[n] = validate(
-                    json.loads(os.environ["VLLM_TKNP_CAPTURE_OWNER_COUNTS"]),
+                    capture_layouts[n] if capture_layouts is not None else json.loads(os.environ["VLLM_TKNP_CAPTURE_OWNER_COUNTS"]),
                     n, free_blocks, blocks_per_request)
                 continue
             split_fn = (
@@ -1539,6 +1593,18 @@ class GPUModelRunner(
             )
 
         slot_count = int(os.environ.get("VLLM_TKNP_GRAPH_SLOTS", "0"))
+        if capture_layouts is not None and self.parallel_config.enable_dbo:
+            # Capacity fitting can alter a requested cohort's local shapes.
+            # Validate the *effective* layouts before any capture threads run.
+            from vllm.forward_context import tknp_cohort_split_point
+            from vllm.v1.worker.tknp_serving_slots import validate_multi_layout_dbo_shapes
+            cohorts = {}
+            for size, counts in self._tknp_graph_splits.items():
+                order = build_tknp_dbo_cohort_rank_order(counts)
+                split = tknp_cohort_split_point(size)
+                cohorts[size] = [(order[:split].count(owner), order[split:].count(owner))
+                                 for owner in range(world_size)]
+            validate_multi_layout_dbo_shapes(cohorts)
         if slot_count:
             if slot_count not in self._tknp_graph_splits:
                 raise RuntimeError("Serving graph lane count must be an exact capture size")
@@ -1573,6 +1639,47 @@ class GPUModelRunner(
                     for size in self.cudagraph_batch_sizes
                 },
             )
+
+    def _tknp_serving_graph_size(self):
+        selected = getattr(self,"_tknp_step_graph_slots",None)
+        return (selected if selected is not None else
+                int(os.environ.get("VLLM_TKNP_GRAPH_SLOTS","0")))
+
+    def _select_tknp_step_graph(self,scheduler_output):
+        ceiling = int(os.environ.get("VLLM_TKNP_GRAPH_SLOTS","0"))
+        self._tknp_step_graph_slots = ceiling
+        if ceiling and os.environ.get("VLLM_TKNP_GRAPH_TAIL_DOWNSIZE","0")=="1":
+            from vllm.v1.worker.tknp_serving_slots import select_resident_replay_size
+            owners = scheduler_output.token_parallel_allocations.req_to_tknp_rank
+            self._tknp_step_graph_slots = select_resident_replay_size(
+                self._tknp_graph_splits,ceiling,
+                [int(owners[req]) for req in self.input_batch.req_ids])
+
+    def activate_tknp_graph_layout(self, size: int, finished_request_ids=()) -> dict:
+        """Called by the serving control plane only after a fully drained step.
+
+        Captured graphs share persistent model/KV/input buffers. Synchronizing
+        completes every stream before changing the host-side layout selector;
+        no CUDA graph is captured, freed, or replayed here.
+        """
+        from vllm.v1.worker.tknp_serving_slots import select_capture_layout
+        import json
+        counts = select_capture_layout(self._tknp_graph_splits, size)
+        torch.cuda.synchronize(self.device)
+        if set(self.requests) - set(finished_request_ids):
+            raise RuntimeError("Model runner has requests not confirmed finished by the frontend")
+        if self.requests or self.input_batch.num_reqs:
+            from vllm.v1.core.sched.output import SchedulerOutput
+            output = SchedulerOutput.make_empty()
+            output.finished_req_ids = set(finished_request_ids)
+            self._update_states(output)
+        if self.requests or self.input_batch.num_reqs:
+            raise RuntimeError("Model runner request state did not drain")
+        os.environ["VLLM_TKNP_GRAPH_SLOTS"] = str(size)
+        os.environ["VLLM_TKNP_GRAPH_SLOT_LIMITS"] = json.dumps(counts)
+        self._tknp_step_graph_slots = None
+        self._tknp_runtime_slot_plan = None
+        return {"graph_size": size, "owner_counts": counts}
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2636,7 +2743,7 @@ class GPUModelRunner(
         # can cache the attention metadata builds and just update the block table using
         # `builder.update_block_table` if the builder supports it.
         cached_attn_metadata: dict[
-            tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
+            tuple[KVCacheSpec, type[AttentionMetadataBuilder], int | None], AttentionMetadata
         ] = {}
 
         def _build_attn_group_metadata(
@@ -2650,7 +2757,10 @@ class GPUModelRunner(
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
-            cache_key = (kv_cache_spec, type(builder))
+            # Different cohorts may have unequal request counts and different
+            # query/sequence-length views. Reuse metadata across KV groups,
+            # never across cohorts (FA supports block-table-only updates).
+            cache_key = (kv_cache_spec, type(builder), ubid)
 
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
@@ -4088,6 +4198,8 @@ class GPUModelRunner(
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+                self._select_tknp_step_graph(scheduler_output)
+
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -4106,6 +4218,7 @@ class GPUModelRunner(
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                graph_slots = self._tknp_serving_graph_size()
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -4113,10 +4226,10 @@ class GPUModelRunner(
                     num_tokens_across_dp,
                     cudagraph_stats,
                 ) = self._determine_batch_execution_and_padding(
-                    num_tokens=int(os.environ.get("VLLM_TKNP_GRAPH_SLOTS", "0")) or num_tokens_unpadded,
-                    num_reqs=int(os.environ.get("VLLM_TKNP_GRAPH_SLOTS", "0")) or num_reqs,
-                    num_scheduled_tokens_np=(np.ones(int(os.environ["VLLM_TKNP_GRAPH_SLOTS"]), dtype=np.int32)
-                                             if os.environ.get("VLLM_TKNP_GRAPH_SLOTS") else num_scheduled_tokens_np),
+                    num_tokens=graph_slots or num_tokens_unpadded,
+                    num_reqs=graph_slots or num_reqs,
+                    num_scheduled_tokens_np=(np.ones(graph_slots, dtype=np.int32)
+                                             if graph_slots else num_scheduled_tokens_np),
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
@@ -4138,8 +4251,8 @@ class GPUModelRunner(
                 from vllm.forward_context import tknp_cohort_split_point
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
-                    (np.ones(int(os.environ["VLLM_TKNP_GRAPH_SLOTS"]), dtype=np.int32)
-                     if os.environ.get("VLLM_TKNP_GRAPH_SLOTS") else num_scheduled_tokens_np),
+                    (np.ones(graph_slots, dtype=np.int32)
+                     if graph_slots else num_scheduled_tokens_np),
                     num_tokens_padded,
                     num_reqs_padded,
                     self.parallel_config.num_ubatches,
@@ -4202,8 +4315,8 @@ class GPUModelRunner(
                     if (max_num_scheduled_tokens != 1 or inputs_embeds is not None
                             or self.uses_mrope or use_spec_decode):
                         raise RuntimeError("Serving graph lanes support text-only, one-token decode without speculation")
-                    logits_indices = torch.tensor(self._tknp_runtime_slot_plan.request_slots,
-                                                  dtype=torch.long, device=self.device)
+                    logits_indices = self._tknp_cached_index_tensor(
+                        "graph_logits_slots", self._tknp_runtime_slot_plan.request_slots, torch.long)
 
                 # In CUDA graph mode, override tokens_per_rank with
                 # pre-computed fixed splits so the NCCL ops use constant
@@ -4221,6 +4334,8 @@ class GPUModelRunner(
                             tknp_metadata.tokens_per_rank[get_tknp_rank()]
                         )
                         tknp_metadata.is_cuda_graph = True
+                        if hasattr(self,"_research_execution_counts"):
+                            self._research_execution_counts[f"tknp_graph_size:{num_tokens_padded}"] += 1
                         replay_key = (
                             num_tokens_padded,
                             tuple(tknp_metadata.tokens_per_rank),

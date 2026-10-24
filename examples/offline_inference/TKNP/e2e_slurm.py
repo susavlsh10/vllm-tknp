@@ -9,22 +9,29 @@ MOUNTS = "/home/sshrestha:/home/sshrestha,/lustre/fsw/hw_nresearch_snoise:/lustr
 
 
 def container_command(config, nodes, command, env=None):
-    return ["srun", f"--jobid={config['slurm_job_id']}", "--overlap", "--mpi=pmix",
+    runtime = config.get("runtime", {})
+    repo = runtime.get("repo", REPO)
+    runtime_env = runtime.get("env", {"LD_LIBRARY_PATH": "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/local/cuda/lib64"})
+    return ["srun", f"--jobid={config['slurm_job_id']}", "--overlap", "--mpi=pmix", "--cpu-bind=none",
             f"--nodes={len(nodes)}", f"--ntasks={len(nodes)}", "--ntasks-per-node=1",
             "--nodelist=" + ",".join(nodes), "--kill-on-bad-exit=1",
-            "--container-image=" + IMAGE, "--container-mounts=" + MOUNTS,
-            "--container-workdir=" + REPO, "env",
-            "PYTHONPATH=" + REPO, "HF_HOME=/lustre/fsw/hw_nresearch_snoise/hf_cache",
+            "--container-image=" + runtime.get("image", IMAGE), "--container-mounts=" + runtime.get("mounts", MOUNTS),
+            *(["--container-name=" + runtime["container_name"]] if runtime.get("container_name") else []),
+            "--container-workdir=" + repo, "env",
+            "PYTHONPATH=" + repo, "HF_HOME=/lustre/fsw/hw_nresearch_snoise/hf_cache",
             "HF_HUB_OFFLINE=1", "NCCL_LAUNCH_ORDER_IMPLICIT=1",
-            "LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/local/cuda/lib64",
-            "VLLM_RESEARCH_GIT_HEAD=ba5fef1d88b4cbc71f7abcd9bc1a370c1e51d5cd",
+            "TKNP_PYTHON=" + runtime.get("python", PYTHON),
+            "VLLM_RESEARCH_GIT_HEAD=" + runtime.get("source_commit", "unknown"),
+            *[f"{key}={value}" for key, value in runtime_env.items()],
             *[f"{key}={value}" for key, value in (env or {}).items()], *command]
 
 
 def launch_role(config, server, index, command, env):
+    runtime = config.get("runtime", {})
+    gpus_per_node = config.get("gpus_per_node", 4)
     devices = {}
     for gpu in server["gpus"]:
-        devices.setdefault(gpu // 4, []).append(gpu % 4)
+        devices.setdefault(gpu // gpus_per_node, []).append(gpu % gpus_per_node)
     mappings = list(devices.values())
     if any(ids != mappings[0] for ids in mappings):
         raise ValueError("A distributed role needs identical local GPU indices on its nodes")
@@ -40,7 +47,7 @@ def launch_role(config, server, index, command, env):
     if not args or not args[0].endswith("e2e_server.py"):
         raise ValueError("Unexpected server command")
     args += ["--host", "0.0.0.0"]
-    worker = ["bash", str(Path(REPO) / "examples/offline_inference/TKNP/jobs/lyris_e2e_role.sh"),
+    worker = ["bash", str(Path(runtime.get("repo", REPO)) / "examples/offline_inference/TKNP/jobs/lyris_e2e_role.sh"),
               str(len(nodes)), str(len(mappings[0])), nodes[0], str(config.get("rdzv_port_base", 23500) + index * 31),
               "external" if len(nodes) > 1 or server.get("tknp", 1) > 1 else "mp",
               *args]
@@ -48,4 +55,4 @@ def launch_role(config, server, index, command, env):
 
 
 def client_command(config, command):
-    return container_command(config, [config["slurm_nodes"][0]], [PYTHON, *command[1:]])
+    return container_command(config, [config["slurm_nodes"][0]], [config.get("runtime", {}).get("python", PYTHON), *command[1:]])

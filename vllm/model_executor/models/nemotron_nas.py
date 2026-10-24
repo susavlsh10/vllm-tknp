@@ -35,6 +35,8 @@ from vllm.attention.backends.abstract import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.distributed.parallel_state import is_tknp_initialized, is_first_tknp_rank
+from vllm.model_executor.layers.token_parallel_linear import init_tknp_layer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -59,6 +61,12 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+# Attention and MLP already reuse TKNP-aware Llama components. Keep all other
+# parameter-bearing layers on the root TP group too, including FFN-only blocks.
+RMSNorm = init_tknp_layer(RMSNorm)
+VocabParallelEmbedding = init_tknp_layer(VocabParallelEmbedding)
+ParallelLMHead = init_tknp_layer(ParallelLMHead)
 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
@@ -313,6 +321,8 @@ class DeciModel(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if is_tknp_initialized() and not is_first_tknp_rank():
+            return set()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -467,6 +477,8 @@ class DeciLMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, HasNoOps):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if is_tknp_initialized() and not is_first_tknp_rank():
+            return set()
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),

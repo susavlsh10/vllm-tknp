@@ -782,6 +782,24 @@ class Scheduler(SchedulerInterface):
             local_free = max(0, local_free - future_growth)
         world_size = get_tknp_world_size()
 
+        if os.environ.get("VLLM_TKNP_CPU_KV_CONTROL", "0") == "1":
+            # These counters are CPU scheduler state, not GPU model data.
+            # A CUDA all-gather followed by one .item() per owner adds device
+            # allocation, H2D/D2H copies and GPU-stream synchronization on
+            # EVERY decode, even when no requests are waiting. Keep the same
+            # collective order and lifetime reservation math, using the
+            # group's already-created CPU communicator and reusable buffers.
+            buffers = getattr(self, "_tknp_cpu_free_block_buffers", None)
+            if buffers is None or len(buffers[1]) != world_size:
+                local = torch.empty(1, dtype=torch.int64, device="cpu")
+                result = torch.empty(world_size, dtype=torch.int64, device="cpu")
+                views = list(result.split(1))
+                buffers = self._tknp_cpu_free_block_buffers = (local, views, result)
+            local, views, result = buffers
+            local[0] = local_free
+            torch.distributed.all_gather(views, local, group=get_tknp_group().cpu_group)
+            return result.tolist()
+
         # all_gather into a tensor (CUDA or CPU; must be same device on all ranks)
         local_tensor = torch.tensor([local_free], dtype=torch.int64, device="cuda")
         gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
@@ -1080,11 +1098,21 @@ class Scheduler(SchedulerInterface):
                                          if placement_policy == "memory" else tokens)
                     unassigned = [req for req in self.waiting
                                   if req.request_id not in planner.req_to_tknp_rank]
-                    assignments = place_fifo(
+                    placement_function = place_fifo
+                    placement_options = {"policy": placement_policy}
+                    if os.environ.get("VLLM_TKNP_BALANCED_WINDOW", "0") != "0":
+                        if placement_policy != "cost":
+                            raise ValueError("Balanced window requires cost placement")
+                        from vllm.v1.core.sched.tknp_placement import place_balanced_window
+                        placement_function = place_balanced_window
+                        placement_options = dict(
+                            window=int(os.environ["VLLM_TKNP_BALANCED_WINDOW"]),
+                            root_bias_tokens=int(os.environ.get("VLLM_TKNP_ROOT_BIAS_TOKENS", "0")))
+                    assignments = placement_function(
                         [PlacementRequest(req.request_id, req.num_prompt_tokens,
                                           req.max_tokens) for req in unassigned],
                         free_blocks_per_rank, self.cache_config.block_size,
-                        loads, placement_policy,
+                        loads, **placement_options,
                         request_limits=([max(0, limit - int(planner.tknp_reqs_per_rank[rank]))
                                          for rank, limit in enumerate(json.loads(os.environ["VLLM_TKNP_GRAPH_SLOT_LIMITS"]))]
                                         if os.environ.get("VLLM_TKNP_GRAPH_SLOTS") else None),
@@ -1184,11 +1212,16 @@ class Scheduler(SchedulerInterface):
                         groups = self.kv_cache_manager.get_block_ids(req_id)
                         allocated = len(groups[0]) if groups else 0
                         live.append((req.num_prompt_tokens, req.max_tokens, allocated))
+                    # A DCP page represents dcp_world_size physical pages'
+                    # worth of logical tokens. Count against that effective
+                    # token span, not an ordinary single-rank page.
+                    lifetime_block_size = (self.cache_config.block_size
+                                           * self.dcp_world_size)
                     free = unreserved_lifetime_blocks(
                         self.kv_cache_manager.block_pool.get_num_free_blocks(),
-                        self.cache_config.block_size, live)
+                        lifetime_block_size, live)
                     needed = math.ceil((request.num_prompt_tokens + request.max_tokens) /
-                                       self.cache_config.block_size)
+                                       lifetime_block_size)
                     if needed > free:
                         native_lifetime_blocked = True
                         # Keep FIFO among new admissions, but continue scanning
@@ -1578,7 +1611,22 @@ class Scheduler(SchedulerInterface):
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            # Synchronous PP already retains immutable prompts on workers and
+            # sends newly sampled tokens above. Rotating pipeline microbatches
+            # must not serialize every 32K+ prompt to every stage on each turn.
+            # Preserve the old payload for async recovery, real preemption,
+            # and connectors unless they explicitly declare it unnecessary.
+            compact_pp = (
+                os.environ.get("VLLM_PP_COMPACT_CACHED_TOKENS", "1") != "0"
+                and self.use_pp
+                and not self.scheduler_config.async_scheduling
+                and (self.connector is None or not getattr(
+                    self.connector, "requires_cached_request_token_ids", True
+                ))
+            )
+            if not scheduled_in_prev_step and (
+                not compact_pp or idx >= num_running_reqs
+            ):
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)

@@ -105,6 +105,10 @@ async def collect(args):
     t0 = time.perf_counter()
     rows = []
     staged = bool(getattr(args, "staged_decode", False))
+    admission_gated=bool(getattr(args,"admission_gated_decode",False))
+    if admission_gated and (staged or args.prefill_urls or any(r["arrival_s"] for r in workload)):
+        raise ValueError("Admission-gated decode requires a cached synthetic zero-arrival burst")
+    admission_release_time=None
     release_time = None
     ready_ids = [set() for _ in args.decode_urls]
     health = []
@@ -220,13 +224,58 @@ async def collect(args):
         if warmup_count:
             warmup = [dict(workload[index % len(workload)], request_id=f"warmup-{index}", arrival_s=0)
                       for index in range(warmup_count)]
+            if getattr(args, "warmup_output_tokens", None):
+                warmup = [dict(request, max_tokens=min(request["max_tokens"], args.warmup_output_tokens))
+                          for request in warmup]
             await asyncio.gather(*(one(i, request, "warmup") for i, request in enumerate(warmup)))
             (args.output / "warmup_requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
             if any(r.get("error") for r in rows):
                 raise RuntimeError("Warmup failed; measurement was not started")
             rows.clear()
             t0 = time.perf_counter()
+        async def snapshots():
+            async def snapshot(url):
+                async with session.get(url.rstrip("/")+"/health") as response:
+                    response.raise_for_status();return await response.json()
+            return await asyncio.gather(*(snapshot(url) for url in args.decode_urls))
+        async def gate_control(action):
+            async def send(url):
+                async with session.post(url.rstrip("/")+"/decode-gate",json=dict(action=action,key=prefix)) as response:
+                    response.raise_for_status()
+            await asyncio.gather(*(send(url) for url in args.decode_urls))
+            deadline=time.perf_counter()+args.timeout
+            while True:
+                state=await snapshots()
+                if all(s.get("last_decode_gate")==prefix+":"+action and not s.get("decode_gate_pending") for s in state):
+                    return state
+                if time.perf_counter()>deadline:raise TimeoutError("Decode gate control timed out")
+                await asyncio.sleep(.005)
+        if admission_gated:
+            deadline=time.perf_counter()+args.timeout
+            while not all(s.get("sweep_drained") for s in await snapshots()):
+                if time.perf_counter()>deadline:raise TimeoutError("Warmup did not drain before decode gating")
+                await asyncio.sleep(.005)
+            await gate_control("hold")
+            t0=time.perf_counter()
         tasks = [asyncio.create_task(one(i, request)) for i, request in enumerate(workload)]
+        if admission_gated:
+            try:
+                deadline=time.perf_counter()+args.timeout
+                while True:
+                    state=await snapshots()
+                    if rows:raise RuntimeError("A request failed or produced output before gated release")
+                    if sum(s["outstanding_requests"] for s in state)==len(workload):break
+                    if time.perf_counter()>deadline:raise TimeoutError("CPU request-admission barrier timed out")
+                    await asyncio.sleep(.005)
+                if any(not s["decode_gate_held"] or s["kv_free_blocks"]!=s["decode_gate_initial_free_blocks"] for s in state):
+                    raise RuntimeError("Request KV was allocated before the decode timer")
+                admission_release_time=time.perf_counter()
+                await gate_control("release")
+            except BaseException:
+                for task in tasks:task.cancel()
+                await asyncio.gather(*tasks,return_exceptions=True)
+                await gate_control("release")
+                raise
         if prefill_barrier:
             deadline = time.perf_counter() + args.timeout
             while len(prefill_ready) < len(workload):
@@ -273,6 +322,17 @@ async def collect(args):
                    routing=args.routing, real_kv_handoff=bool(args.prefill_urls),
                    warmup_requests=args.warmup_requests,
                    measurement="client wall time; prefill, handoff, queuing, drain included")
+    if admission_gated:
+        preparation=admission_release_time-t0
+        decode_seconds=finished_time-admission_release_time
+        release_ttft=[r["arrival_s"]+r["dispatch_lateness_s"]+r["token_times_s"][0]-preparation
+                      for r in rows if not r.get("error")]
+        summary["admission_gated_decode"]=dict(seconds=decode_seconds,gate_key=prefix,
+            output_tokens=summary["output_tokens"],output_tps=summary["output_tokens"]/decode_seconds,
+            preparation_seconds=preparation,cpu_admitted_requests=len(workload),
+            ttft_from_release_s={f"p{int(q*100)}":percentile(release_ttft,q) for q in (.5,.95,.99)},
+            scope="All CPU requests queued before timer; no request KV allocated before release; includes KV admission/waves, decode, streaming and drain; excludes HTTP body preparation and preinitialized random-KV fill; NOT prefill or online arrivals")
+        summary["measurement"]="Use admission_gated_decode for cached decode batch makespan; ordinary TTFT fields include intentional preparation hold"
     if staged:
         decode_seconds = finished_time - release_time
         summary["staged_decode"] = {
@@ -320,8 +380,12 @@ def main():
     bench.add_argument("--routing", choices=["least-work", "round-robin"], default="least-work")
     bench.add_argument("--warmup-requests", type=int, default=0,
                        help="Complete a separate burst before replay; use zero for cold-start studies")
+    bench.add_argument("--warmup-output-tokens", type=int,
+                       help="Optional bounded warmup output length; never changes measured requests")
     bench.add_argument("--staged-decode", action="store_true",
                        help="Prime one token and hold real or synthetic KV resident, then release together")
+    bench.add_argument("--admission-gated-decode",action="store_true",
+                       help="Queue all CPU requests, then time natural KV admission/queueing and decode")
     bench.add_argument("--prefill-barrier", action="store_true",
                        help="Prepare real KV exports before a decode burst; producer exports must fit")
     bench.add_argument("--timeout", type=float, default=600)

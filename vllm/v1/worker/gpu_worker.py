@@ -61,6 +61,28 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+
+def _isolate_research_compile_caches(rank: int) -> None:
+    """Opt-in isolation of concurrent Lustre cache writers, not GPU math."""
+    from pathlib import Path
+    if os.environ.get("VLLM_RESEARCH_RANK_TRITON_CACHE", "0") == "1":
+        root=os.environ.get("TRITON_CACHE_DIR")
+        if root:
+            path=Path(root)
+            suffix=f"worker_rank_{rank}"
+            if path.name!=suffix:path=path/suffix
+            path.mkdir(parents=True,exist_ok=True)
+            os.environ["TRITON_CACHE_DIR"]=str(path)
+    if os.environ.get("VLLM_RESEARCH_RANK_INDUCTOR_CACHE", "0") == "1":
+        import socket
+        root=os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        if root:
+            path=Path(root)
+            suffix=(socket.gethostname(),f"worker_rank_{rank}")
+            if path.parts[-2:]!=suffix:path=path.joinpath(*suffix)
+            path.mkdir(parents=True,exist_ok=True)
+            os.environ["TORCHINDUCTOR_CACHE_DIR"]=str(path)
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -85,6 +107,12 @@ class Worker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+        # Research sweeps may start 32 workers together on a shared Lustre
+        # cache. Independent Triton writers can observe an incomplete binary
+        # group there. Isolate compilation only; GPU kernels/timing are
+        # unchanged, and ordinary users retain their existing cache policy.
+        _isolate_research_compile_caches(rank)
 
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
@@ -537,15 +565,24 @@ class Worker(WorkerBase):
                 and self.parallel_config.enable_token_parallel
                 and self.parallel_config.token_parallel_size > 1
             )
-            hidden_states, last_hidden_states = self.model_runner._dummy_run(
-                num_tokens=max_num_reqs,
-                skip_eplb=True,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                # This sampler-buffer initialization can be larger than the
-                # one exact TKNP graph captured by the homogeneous POC. Keep
-                # it uncompiled; it is never part of benchmark measurement.
-                is_profile=fixed_tknp_cudagraph,
-            )
+            if (fixed_tknp_cudagraph and os.environ.get("VLLM_TKNP_CAPTURE_LAYOUTS")
+                    and not self.model_runner.is_pooling_model):
+                # _dummy_sampler_run discards hidden-state values and uses
+                # rand_like. It only needs the maximum shape. Running another
+                # *non-microbatched* model forward after DBO capture can reuse
+                # a static compiled fragment with incompatible cohort shapes;
+                # do_not_compile cannot undo an installed bytecode hook.
+                last_hidden_states = torch.empty(
+                    (max_num_reqs, self.model_config.get_hidden_size()),
+                    dtype=self.model_config.dtype, device=self.device)
+            else:
+                hidden_states, last_hidden_states = self.model_runner._dummy_run(
+                    num_tokens=max_num_reqs,
+                    skip_eplb=True,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    # This initialization-only pass is not benchmark work.
+                    is_profile=fixed_tknp_cudagraph,
+                )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:

@@ -7,7 +7,7 @@ tknp_port=$4
 tknp_style=$5
 shift 5
 export VLLM_NIXL_SIDE_CHANNEL_HOST="$(hostname -s)"
-tknp_python=/home/sshrestha/workspace/2026/vllm-tknp-lyris-venv/bin/python3
+tknp_python=${TKNP_PYTHON:-/home/sshrestha/workspace/2026/vllm-tknp-lyris-venv/bin/python3}
 # This launcher is dedicated to the matched collection suite. Ordinary
 # baselines use native graph buckets, even when resuming an older controller.
 tknp_args=("$@")

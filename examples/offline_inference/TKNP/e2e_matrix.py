@@ -7,15 +7,62 @@ P/D and colocated trials are explicitly distinct; no budget-equivalent claim
 is inferred from this smoke matrix. Independent DP replicas really execute.
 """
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
 import time
 import urllib.request
+
+
+def split_sweep_journals(shared, keys, destination):
+    """Byte-preserving segment views, retaining the immutable full journals.
+
+    Parse only boundary records, once per raw journal. Every point retains
+    its preparation, warmup, gate, request and step events, plus the original
+    global shutdown record used by the existing leak audit.
+    """
+    if not keys or len(set(keys)) != len(keys):
+        raise ValueError("Unique segment keys required")
+    paths={key:destination/f"segment-{i:04d}" for i,key in enumerate(keys)}
+    for path in paths.values():path.mkdir(parents=True,exist_ok=False)
+    provenance={}
+    for journal in sorted(shared.glob("rank*.jsonl")):
+        active=None;starts={};stops={};shutdown=None;digest=hashlib.sha256()
+        with ExitStack() as stack:
+            outputs={key:stack.enter_context((path/journal.name).open("w")) for key,path in paths.items()}
+            with journal.open() as stream:
+                for number,line in enumerate(stream,1):
+                    digest.update(line.encode())
+                    boundary=json.loads(line) if '"sweep_control"' in line else None
+                    if boundary and boundary.get("event")=="sweep_control":
+                        key=boundary["key"]
+                        if boundary["action"]=="prepare":
+                            if active is not None or key not in paths or key in starts:
+                                raise RuntimeError("Invalid or repeated sweep preparation")
+                            active=key;starts[key]=number
+                        elif boundary["action"]=="checkpoint":
+                            if active!=key or key in stops:
+                                raise RuntimeError("Unmatched sweep checkpoint")
+                            outputs[key].write(line);stops[key]=number;active=None
+                            continue
+                    if active is not None:outputs[active].write(line)
+                    if '"shutdown"' in line and json.loads(line).get("event")=="shutdown":
+                        shutdown=line
+            if active is not None or set(starts)!=set(keys) or set(stops)!=set(keys) or shutdown is None:
+                raise RuntimeError("Incomplete sweep journal boundaries/shutdown")
+            for output in outputs.values():output.write(shutdown)
+        provenance[journal.name]=dict(raw_journal=str(journal),sha256=digest.hexdigest(),
+            inclusive_line_bounds={key:[starts[key],stops[key]] for key in keys},
+            shutdown_scope="Original global shutdown appended unchanged; full journal retained")
+    if not provenance:raise RuntimeError("No sweep journals")
+    (destination/"provenance.json").write_text(json.dumps(provenance,indent=2)+"\n")
+    return paths
 
 
 def validate_matrix(config, gpu_count):
@@ -48,17 +95,152 @@ def validate_matrix(config, gpu_count):
                 raise ValueError("Real NIXL handoff into DCP interleaved KV is not implemented")
             if role.get("tknp", 1) > 1 and role.get("connector") not in {"nixl", "synthetic"}:
                 raise ValueError("TKNP requires real NIXL or explicitly labeled synthetic KV")
-            if any(not name.startswith(("VLLM_TKNP_", "NCCL_")) and name != "VLLM_KV_CACHE_LAYOUT"
+            if any(not name.startswith(("VLLM_TKNP_", "NCCL_")) and name not in {
+                       "VLLM_KV_CACHE_LAYOUT", "VLLM_PP_COMPACT_CACHED_TOKENS", "VLLM_CACHE_PROMPT_TOKEN_IDS"}
                    for name in role.get("env", {})):
-                raise ValueError("Role environment overrides are limited to TKNP/NCCL settings")
+                raise ValueError("Role environment overrides are limited to TKNP/NCCL and explicit PP baseline settings")
         if len(set(used)) != len(used):
             raise ValueError("Concurrent roles overlap GPUs")
+
+
+def sweep_control(urls, processes, body):
+    """Run GPU-affecting benchmark control on the idle engine main thread."""
+    for url in urls:
+        request = urllib.request.Request(url + "/sweep-control",
+            data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=5):
+            pass
+    pending = set(urls)
+    deadline = time.monotonic() + 120
+    while pending:
+        if any(p.poll() is not None for p in processes):
+            raise RuntimeError("Server exited during sweep control")
+        for url in list(pending):
+            with urllib.request.urlopen(url + "/health", timeout=2) as response:
+                status = json.load(response)
+            if status.get("last_sweep_control") == body["key"] + ":" + body["action"]:
+                pending.remove(url)
+        if time.monotonic() > deadline:
+            raise TimeoutError("Sweep control timeout")
+        time.sleep(0.05)
+
+
+def run_client(trial, config, workload, destination, urls, processes):
+    here = Path(__file__).resolve().parent
+    command = [sys.executable, str(here / "e2e_workload.py"), "run", "--workload", str(workload),
+               "--output", str(destination), "--decode-urls"] + urls["decode"]
+    if urls["prefill"]:
+        command += ["--prefill-urls"] + urls["prefill"]
+    if trial.get("staged_decode"):
+        command += ["--staged-decode"]
+    if trial.get("prefill_barrier"):
+        command += ["--prefill-barrier"]
+    if config.get("admission_gated_decode"):
+        command += ["--admission-gated-decode"]
+    for key in ("warmup_requests", "warmup_output_tokens", "routing", "timeout", "ttft_slo", "tpot_slo"):
+        if key in config:
+            command += ["--" + key.replace("_", "-"), str(config[key])]
+    if config.get("slurm_job_id"):
+        from e2e_slurm import client_command
+        command = client_command(config, command)
+    if config.get("verify_busy_switch_rejection"):
+        process = subprocess.Popen(command)
+        try:
+            deadline = time.monotonic() + 30
+            verified = False
+            while process.poll() is None and time.monotonic() < deadline:
+                with urllib.request.urlopen(urls["decode"][0] + "/health", timeout=2) as response:
+                    status = json.load(response)
+                if status["outstanding_requests"]:
+                    body = dict(key="busy-check", action="prepare", graph_size=status["active_graph_size"])
+                    request = urllib.request.Request(urls["decode"][0] + "/sweep-control",
+                        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
+                    try:
+                        with urllib.request.urlopen(request, timeout=2):
+                            raise RuntimeError("Server accepted a graph switch with live requests")
+                    except urllib.error.HTTPError as error:
+                        if error.code != 409:
+                            raise
+                    verified = True
+                    print("BUSY_GRAPH_SWITCH_REJECTED", flush=True)
+                    break
+                time.sleep(0.005)
+            if not verified:
+                raise RuntimeError("Could not verify live-request graph-switch rejection")
+            returncode = process.wait(timeout=config.get("timeout", 3600) + 120)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, command)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+    else:
+        subprocess.run(command, check=True, timeout=config.get("timeout", 3600) + 120)
+    deadline = time.monotonic() + 30
+    while True:
+        counts = []
+        for url in urls["prefill"] + urls["decode"]:
+            with urllib.request.urlopen(url + "/health", timeout=2) as response:
+                status = json.load(response)
+                counts.append(status["outstanding_requests"] or not status.get("sweep_drained", True))
+        if not any(counts):
+            break
+        if any(p.poll() is not None for p in processes) or time.monotonic() > deadline:
+            raise RuntimeError("Request/KV state did not drain after completed workload")
+        time.sleep(0.02)
+
+
+def validate_live_segment(trial, segment, output):
+    """Fail a smoke BEFORE starting primary measurements in the same engine."""
+    client = json.loads((output / (segment["key"] + "-client") / "summary.json").read_text())
+    expected = segment["smoke_output_tokens"]
+    if client["completed"] != segment["batch"] or client["failed"] or client["output_tokens"] != segment["batch"] * expected:
+        raise RuntimeError("Smoke request completion failed")
+    for index, role in enumerate(trial["servers"]):
+        server = output / f"server{index}"
+        records = json.loads((server / (segment["key"] + "-execution.json")).read_text())
+        manifest = json.loads((server / "manifest.json").read_text())
+        if sorted(r["rank"] for r in records) != list(range(len(role["gpus"]))):
+            raise RuntimeError("Smoke lacks execution records for assigned ranks")
+        for record in records:
+            counts = record["counts"]
+            expected_mode = "FULL" if role.get("cuda_graph", False) else "NONE"
+            if (counts.get("decode:" + expected_mode, 0) <= 0
+                    or any(n for key, n in counts.items() if key.startswith("decode:") and key != "decode:" + expected_mode)
+                    or (role.get("cuda_graph", False) and counts.get("graph:FULL_REPLAY", 0) <= 0)
+                    or (not role.get("cuda_graph", False) and counts.get("graph:FULL_REPLAY", 0))
+                    or record.get("per_request_kv_fill_calls", 0)):
+                raise RuntimeError("Smoke graph/execution-mode/no-timed-KV-fill check failed")
+            if role.get("graph_layouts"):
+                initial = next(r for r in manifest["worker_resources"] if r["rank"] == record["rank"])
+                if (record["graph_reuse_identity"] != initial["graph_reuse_identity"]
+                        or record["active_graph_size"] != segment["graph_size"]):
+                    raise RuntimeError("Smoke changed model/KV/graph identities or selected the wrong layout")
+        # External TKNP has one journal per global rank; native MP has the
+        # central scheduler journal. All present journals must be drained.
+        for journal in server.glob("rank*.jsonl"):
+            boundary, deadline = None, time.monotonic() + 5
+            while boundary is None:
+                for line in journal.read_text().splitlines():
+                    event = json.loads(line)
+                    if event["event"] == "sweep_control" and event.get("key") == segment["key"] and event.get("action") == "checkpoint":
+                        boundary = event
+                if boundary is not None or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            if not boundary or not boundary["all_kv_free"] or boundary["remaining_requests"]:
+                raise RuntimeError("Smoke did not fully drain KV/requests")
 
 
 def run_trial(trial, config, workload, output):
     here = Path(__file__).resolve().parent
     processes, logs, urls = [], [], {"prefill": [], "decode": []}
     launches = []
+    segments = config.get("client_sweep")
+    if segments and (any(role.get("tknp", 1) > 1 and role.get("cuda_graph", False)
+                         and not role.get("graph_layouts") for role in trial["servers"])
+                     or any(role["role"] != "decode" for role in trial["servers"])):
+        raise ValueError("Persistent TKNP sweeps need explicit graph layouts and decode-only endpoints")
     output.mkdir()
     try:
         for index, server in enumerate(trial["servers"]):
@@ -81,6 +263,11 @@ def run_trial(trial, config, workload, output):
                         "--max-num-seqs", str(server.get("max_num_seqs", config.get("max_num_seqs", 16))),
                         "--max-num-batched-tokens", str(server.get("max_num_batched_tokens", config.get("max_num_batched_tokens", 2048))),
                         "--kv-cache-dtype", config.get("kv_cache_dtype", "auto")]
+            if config.get("tokenizer"):
+                command += ["--tokenizer", config["tokenizer"]]
+            for flag in ("dummy_fbgemm_fp8", "require_fbgemm_fp8", "dummy_modelopt_fp8", "require_modelopt_fp8", "preinitialize_random_kv", "preinitialize_constant_kv"):
+                if config.get(flag):
+                    command += ["--" + flag.replace("_", "-")]
             kv_bytes = server.get("kv_cache_memory_bytes", config.get("kv_cache_memory_bytes"))
             if kv_bytes is not None:
                 command += ["--kv-cache-memory-bytes", str(kv_bytes)]
@@ -88,7 +275,7 @@ def run_trial(trial, config, workload, output):
             for option in ("tp", "pp", "tknp", "dcp", "connector", "placement"):
                 if option in server:
                     command += ["--" + option, str(server[option])]
-            for option in ("cuda_graph", "enable_dbo", "graph_slots", "fixed_wave", "disable_compile", "disable_combo_kernels", "record_logit_topk", "record_full_logits", "native_graph_shapes"):
+            for option in ("cuda_graph", "enable_dbo", "graph_slots", "fixed_wave", "disable_compile", "disable_combo_kernels", "record_logit_topk", "record_full_logits", "skip_diagnostic_kv", "native_graph_shapes"):
                 if server.get(option):
                     command += ["--" + option.replace("_", "-")]
             for option in ("graph_batch_size", "fixed_output_tokens", "profile_steps", "profile_after_step", "pp_decode_microbatch"):
@@ -96,6 +283,8 @@ def run_trial(trial, config, workload, output):
                     command += ["--" + option.replace("_", "-"), str(server[option])]
             if server.get("owner_counts"):
                 command += ["--owner-counts"] + list(map(str, server["owner_counts"]))
+            if server.get("graph_layouts"):
+                command += ["--graph-layouts", json.dumps(server["graph_layouts"])]
             if config.get("require_bf16"):
                 command += ["--require-bf16"]
             url = f"http://127.0.0.1:{port}"
@@ -114,7 +303,7 @@ def run_trial(trial, config, workload, output):
             processes.append(subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True))
             urls[server["role"]].append(url)
         pending = set(urls["decode"] + urls["prefill"])
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + config.get("startup_timeout", 900)
         while pending:
             if any(p.poll() is not None for p in processes):
                 raise RuntimeError("Server exited during initialization")
@@ -128,33 +317,27 @@ def run_trial(trial, config, workload, output):
             if time.monotonic() > deadline:
                 raise TimeoutError("Server initialization timeout")
             time.sleep(1)
-        command = [sys.executable, str(here / "e2e_workload.py"), "run", "--workload", str(workload),
-                   "--output", str(output / "client"), "--decode-urls"] + urls["decode"]
-        if urls["prefill"]:
-            command += ["--prefill-urls"] + urls["prefill"]
-        if trial.get("staged_decode"):
-            command += ["--staged-decode"]
-        if trial.get("prefill_barrier"):
-            command += ["--prefill-barrier"]
-        for key in ("warmup_requests", "routing", "timeout", "ttft_slo", "tpot_slo"):
-            if key in config:
-                command += ["--" + key.replace("_", "-"), str(config[key])]
-        if config.get("slurm_job_id"):
-            from e2e_slurm import client_command
-            command = client_command(config, command)
-        subprocess.run(command, check=True, timeout=config.get("timeout", 3600) + 120)
-        # Transfer acknowledgements must drain, not just the client streams.
-        deadline = time.monotonic() + 30
-        while True:
-            counts = []
-            for url in urls["prefill"] + urls["decode"]:
-                with urllib.request.urlopen(url + "/health", timeout=2) as response:
-                    counts.append(json.load(response)["outstanding_requests"])
-            if not any(counts):
-                break
-            if any(p.poll() is not None for p in processes) or time.monotonic() > deadline:
-                raise RuntimeError("Request/KV state did not drain after completed workload")
-            time.sleep(0.02)
+        if segments:
+            for segment in segments:
+                body = dict(key=segment["key"], action="prepare",
+                            reset_random_kv=(config.get("preinitialize_random_kv", False)
+                                             or config.get("preinitialize_constant_kv",False)))
+                if segment.get("pp_decode_microbatch"):
+                    body["pp_decode_microbatch"] = segment["pp_decode_microbatch"]
+                if segment.get("graph_size"):
+                    body["graph_size"] = segment["graph_size"]
+                sweep_control(urls["decode"], processes, body)
+                print("SEGMENT_START", segment["key"], flush=True)
+                run_client(trial, config, Path(segment["workload"]),
+                           output / (segment["key"] + "-client"), urls, processes)
+                sweep_control(urls["decode"], processes,
+                              dict(key=segment["key"], action="checkpoint"))
+                if segment.get("smoke_output_tokens"):
+                    validate_live_segment(trial, segment, output)
+                    print("SMOKE_VALIDATED", segment["key"], flush=True)
+                print("SEGMENT_DRAINED", segment["key"], flush=True)
+        else:
+            run_client(trial, config, workload, output / "client", urls, processes)
     finally:
         for url in urls["prefill"] + urls["decode"]:
             try:
@@ -164,7 +347,7 @@ def run_trial(trial, config, workload, output):
                 pass
         if config.get("slurm_job_id"):
             for index, role in enumerate(trial["servers"]):
-                nodes = sorted({gpu // 4 for gpu in role["gpus"]})
+                nodes = sorted({gpu // config.get("gpus_per_node", 4) for gpu in role["gpus"]})
                 if len(nodes) < 2 or role.get("tknp", 1) > 1:
                     continue
                 # First let the leader collect ALL worker execution counters.
@@ -201,10 +384,46 @@ def run_trial(trial, config, workload, output):
                 process.wait()
         for log in logs:
             log.close()
+    if segments:
+        journal_views={index:split_sweep_journals(output/f"server{index}",
+            [segment["key"] for segment in segments],output/"segment_journals"/f"server{index}")
+            for index in range(len(trial["servers"]))}
+        results = []
+        for segment in segments:
+            point = Path(segment["output"])
+            point.mkdir()
+            (point / "client").symlink_to(os.path.relpath(output / (segment["key"] + "-client"), point))
+            (point / "launches.json").symlink_to(os.path.relpath(output / "launches.json", point))
+            for index, role in enumerate(trial["servers"]):
+                shared = output / f"server{index}"
+                target = point / f"server{index}"
+                target.mkdir()
+                shutil.copy2(shared / "manifest.json", target / "manifest.json")
+                shutil.copy2(shared / (segment["key"] + "-execution.json"), target / "execution.json")
+                for journal in journal_views[index][segment["key"]].glob("rank*.jsonl"):
+                    (target / journal.name).symlink_to(os.path.relpath(journal, target))
+                (point / f"server{index}.log").symlink_to(os.path.relpath(output / f"server{index}.log", point))
+            point_trial = json.loads(json.dumps(trial))
+            point_trial["name"] += "-" + segment["key"]
+            for role in point_trial["servers"]:
+                if segment.get("pp_decode_microbatch"):
+                    role["pp_decode_microbatch"] = segment["pp_decode_microbatch"]
+                if segment.get("graph_size"):
+                    role["active_graph_size"] = segment["graph_size"]
+            (point / "segment.json").write_text(json.dumps(segment, indent=2) + "\n")
+            results.append(collect_trial_result(point_trial, config, Path(segment["workload"]), point))
+        return results
+    return collect_trial_result(trial, config, workload, output)
+
+
+def collect_trial_result(trial, config, workload, output):
+    launches = json.loads((output / "launches.json").read_text())
     rows = [json.loads(line) for line in (output / "client/requests.jsonl").read_text().splitlines()]
     telemetry = {}
     measured_ids = {row["server_request_id"] for row in rows}
-    for journal in output.glob("server*/rank*.jsonl"):
+    journals={journal:[json.loads(line) for line in journal.read_text().splitlines()]
+              for journal in output.glob("server*/rank*.jsonl")}
+    for journal,events in journals.items():
         admitted = {}
         queue_seconds = {}
         ready_seconds = {}
@@ -213,7 +432,7 @@ def run_trial(trial, config, workload, output):
         measured_preemptions = 0
         steps = []
         shutdown = None
-        for event in map(json.loads, journal.read_text().splitlines()):
+        for event in events:
             if event["event"] == "admit":
                 admitted[event["request_id"]] = event["time"]
             elif event["event"] == "first_compute" and event["request_id"] in measured_ids:
@@ -224,7 +443,7 @@ def run_trial(trial, config, workload, output):
                 ready_times[event["request_id"]] = event["time"]
                 if event["request_id"] in measured_ids:
                     ready_seconds[event["request_id"]] = event["time"] - admitted[event["request_id"]]
-            elif event["event"] == "step":
+            elif event["event"] == "step" and set(event.get("scheduled_request_ids", [])) & measured_ids:
                 steps.append(event)
             elif event["event"] == "shutdown":
                 shutdown = event
@@ -237,6 +456,7 @@ def run_trial(trial, config, workload, output):
             "kv_ready_timing_scope": "scheduler-visible completion; includes KV admission/handshake/transfer polling, NOT pure wire time",
             "max_waiting": max((step["waiting"] for step in steps), default=0),
             "max_waiting_capacity": max((step.get("waiting_capacity", 0) for step in steps), default=0),
+            "waiting_capacity_scope": "Legacy field counts WAITING scheduler status, not reason-coded KV stalls; includes token/sequence limits and PP pipeline scheduling",
             "max_preemptions_live": max((step["preemptions"] for step in steps), default=0),
             "preemptions_total": max((step.get("preemptions_total", 0) for step in steps), default=0),
             "preemptions_measured": measured_preemptions,
@@ -252,9 +472,11 @@ def run_trial(trial, config, workload, output):
     result["engine_stage_latency"] = {}
     for phase in ("prefill", "decode", "mixed", "transfer_only"):
         grouped = {}
-        for journal in output.glob("server*/rank*.jsonl"):
-            for step in map(json.loads, journal.read_text().splitlines()):
+        for journal,events in journals.items():
+            for step in events:
                 if step["event"] != "step" or step.get("phase") != phase:
+                    continue
+                if not set(step.get("scheduled_request_ids", [])) & measured_ids:
                     continue
                 # The first server can be a producer or decoder. Group by
                 # server and step, not by rank; count slowest-rank wall time.

@@ -63,3 +63,27 @@ def place_fifo(requests, available_blocks, block_size, loads=None, policy="cost"
         costs[rank] += (1 if policy == "count" else needed if policy == "memory"
                         else req.prompt_tokens + req.output_tokens)
     return assignments
+
+
+def place_balanced_window(requests, available_blocks, block_size, loads=None,
+                          request_limits=None, window=64, root_bias_tokens=0):
+    """LPT placement within a bounded FIFO prefix; never reorder admission.
+
+    Try a shorter prefix when the whole candidate prefix cannot fit. Thus no
+    later request reserves capacity ahead of an unassigned older request.
+    Owner/KV migration is not performed. Bias is an explicit cost proxy only.
+    """
+    if window<1 or root_bias_tokens<0:
+        raise ValueError('Invalid balanced-window settings')
+    requests=list(requests)
+    limits=list(request_limits) if request_limits is not None else [len(requests)]*len(available_blocks)
+    count=min(len(requests),window,sum(limits))
+    costs=list(loads or [0]*len(available_blocks))
+    costs[0]+=root_bias_tokens
+    for size in range(count,0,-1):
+        prefix=requests[:size]
+        ordered=sorted(prefix,key=lambda r:-(r.prompt_tokens+r.output_tokens))
+        assignments=place_fifo(ordered,available_blocks,block_size,costs,'cost',limits)
+        if len(assignments)==size:
+            return {r.request_id:assignments[r.request_id] for r in prefix}
+    return {}
