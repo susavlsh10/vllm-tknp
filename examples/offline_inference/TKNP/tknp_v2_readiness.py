@@ -22,6 +22,7 @@ def main():
     p.add_argument('--fp8',action='store_true')
     p.add_argument('--logits',action='store_true',help='Correctness-only full logits')
     p.add_argument('--profile-steps',type=int,default=0)
+    p.add_argument('--profile-after-step',type=int,default=8)
     p.add_argument('--standard-cpu',action='store_true',
                    help='Match paper baseline CPU flags (both optimizations off)')
     p.add_argument('--context',type=int,default=128)
@@ -68,7 +69,8 @@ def main():
         native_graph_shapes=args.tknp==1,graph_batch_size=args.slots,max_num_seqs=args.slots,
         placement='count',env={'VLLM_TKNP_LIFETIME_ADMISSION':'1'})
     if args.logits:role.update(record_full_logits=True,skip_diagnostic_kv=True)
-    if args.profile_steps:role.update(profile_steps=args.profile_steps,profile_after_step=8)
+    if args.profile_steps:role.update(profile_steps=args.profile_steps,
+                                     profile_after_step=args.profile_after_step)
     if args.kv_bytes:role['kv_cache_memory_bytes']=args.kv_bytes
     if args.tknp>1 and not args.eager:
         sizes=sorted(set(args.layout_sizes or [args.slots]))
