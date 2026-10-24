@@ -33,6 +33,7 @@ def main():
     from eos_efficiency import write_json
     from eos_405b_efficiency import summarize
     from tknp_v2_405b_sweep import equal_layouts
+    from nemotron4_capacity import smaller_equal_capacity
     snapshot=verify_snapshot(args.source)
     gate=json.loads(args.readiness.read_text())
     assert gate['passed']
@@ -43,7 +44,7 @@ def main():
         job=args.job,nodes=args.nodes,source_commit=snapshot['commit'],source=str(args.source),
         model_config_sha256=hashlib.sha256((args.parent/'models/340b_fp8/config.json').read_bytes()).hexdigest(),
         tokenizer=str(args.parent/'tokenizer'),input_lengths=[32768,65536],output_length=1024,
-        batches=BATCHES,capacities={},trials=[],
+        batches=BATCHES,capacities={},probe_capacities={},trials=[],
         caveats=['Custom Llama-derived mixed FBGEMM FP8/BF16 dummy recipe, BF16 random KV.',
                  'Original model is4K; linear32 RoPE extension is a synthetic systems proxy, not128K accuracy.',
                  'Admission-gated completion includes natural waves; initialization/prefill excluded.',
@@ -71,6 +72,7 @@ def main():
         caps=probe['trials'][0]['capacity']
         if min(caps)<1:raise RuntimeError('No physical lifetime capacity')
         state['capacities'][str(context)]=caps
+        state['probe_capacities'][str(context)]=caps
         options=['--tokens','1024','--batches',*map(str,BATCHES)]
         if args.method=='tknp-v2-tp8':
             slots,layouts=equal_layouts(BATCHES,caps)
@@ -86,15 +88,48 @@ def main():
             plan=dict(physical_capacity=caps,graph_ceiling=min(max(BATCHES),caps[0]))
         write_json(directory/'capacity_plan.json',plan)
         print('SWEEP_START',args.method,context,'capacity',caps,flush=True)
-        result=run('sweep',options)
+        sweep_name='sweep'
+        if args.method=='tknp-v2-tp8':
+            plan['probe_physical_owner_capacities']=caps
+            plan['startup_attempts']=[]
+            block_sizes={r['block_tokens'] for r in probe['trials'][0]['resources']}
+            assert len(block_sizes)==1
+            base_options=['--tokens','1024','--batches',*map(str,BATCHES)]
+            for attempt in range(3):
+                sweep_name='sweep' if attempt==0 else 'sweep-startup-retry'+str(attempt)
+                options=base_options+['--slots',str(slots),'--layouts',*map(str,layouts)]
+                try:
+                    result=run(sweep_name,options)
+                except subprocess.CalledProcessError:
+                    if attempt==2:
+                        raise
+                    evidence=smaller_equal_capacity(directory/sweep_name,slots,4,
+                        context,1024,next(iter(block_sizes)))
+                    plan['startup_attempts'].append(evidence)
+                    slots,layouts=equal_layouts(BATCHES,
+                        [evidence['equal_graph_ceiling']//4]*4)
+                    plan.update(equal_graph_ceiling=slots,layouts=layouts)
+                    write_json(directory/'capacity_plan.json',plan)
+                    print('STARTUP_CAPACITY_RETRY',context,sweep_name,evidence,flush=True)
+                else:
+                    break
+            actual=result['trials'][0]['capacity']
+            assert 4*min(actual)>=slots
+            plan.update(physical_owner_capacities=actual,actual_physical_owner_capacities=actual,
+                        successful_sweep=sweep_name,unused_slots=sum(actual)-slots)
+            state['capacities'][str(context)]=actual
+            write_json(directory/'capacity_plan.json',plan)
+        else:
+            result=run(sweep_name,options)
         for point in result['trials']:
-            path=directory/'sweep'/('b'+str(point['batch']))
+            path=directory/sweep_name/('b'+str(point['batch']))
             raw=json.loads((path/'trial.json').read_text())
             row=summarize(path,raw['trial'],point['batch'],1024,context)
             row.update(method=args.method,pp_baseline='scheduling-only' if args.method=='tp8-pp4' else None,
                 resources=point['resources'],source_commit=snapshot['commit'],job=args.job,
                 nodes=args.nodes,workload_sha256=raw['workload_sha256'],
                 tknp_microbatching=False,tknp_v2=args.method=='tknp-v2-tp8',
+                sweep_attempt=sweep_name,
                 pp_scheduler_cap_policy='ceil(min(offered,resident_capacity)/4)' if args.method=='tp8-pp4' else None,
                 native_pipeline_concurrency=4 if args.method=='tp8-pp4' else None)
             state['trials'].append(row);write_json(args.output/'summary.json',state)
