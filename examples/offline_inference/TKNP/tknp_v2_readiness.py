@@ -14,6 +14,7 @@ def main():
     p.add_argument('--nodes',nargs='+',required=True)
     p.add_argument('--model',default='meta-llama/Llama-3.1-8B-Instruct')
     p.add_argument('--tokenizer',default='/lustre/fsw/hw_nresearch_snoise/sshrestha/tknp_eos_results/nemotron_modelopt_20261023/tokenizer')
+    p.add_argument('--bos-token-id',type=int,default=128000)
     p.add_argument('--tp',type=int,default=1)
     p.add_argument('--tknp',type=int,default=2)
     p.add_argument('--legacy',action='store_true')
@@ -80,7 +81,8 @@ def main():
         role['env'].update(VLLM_TKNP_REQUIRE_CUDAGRAPH='1',VLLM_TKNP_CAPTURE_REBALANCE='1',
             VLLM_TKNP_CUDAGRAPH_REQUEST_TOKENS=str(args.context+reserve))
     trial=dict(name='tknp-v2-readiness',servers=[role])
-    segments=[dict(key='b'+str(b),batch=b,workload=str(workload(args.output,args.context,b,args.tokens)),
+    segments=[dict(key='b'+str(b),batch=b,workload=str(workload(
+                   args.output,args.context,b,args.tokens,bos_token_id=args.bos_token_id)),
                    output=str(args.output/('b'+str(b)))) for b in args.batches]
     if args.tknp>1 and not args.eager:
         for segment in segments:

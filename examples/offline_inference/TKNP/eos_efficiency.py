@@ -193,10 +193,12 @@ def audit_point(path, trial, batch, tokens, profiled=False, context=32768):
         all_ranks_verified=True, measured_preemptions=0, path=str(path))
 
 
-def workload(output, context, batch, tokens):
-    path = output / f"workload-c{context}-b{batch}-o{tokens}.jsonl"
+def workload(output, context, batch, tokens, bos_token_id=128000):
+    suffix = '' if bos_token_id == 128000 else f'-bos{bos_token_id}'
+    path = output / f"workload-c{context}-b{batch}-o{tokens}{suffix}.jsonl"
     if not path.exists():
-        path.write_text("".join(json.dumps(r) + "\n" for r in make_workload(batch, [context], [tokens], 0, 20261018)))
+        path.write_text("".join(json.dumps(r) + "\n" for r in make_workload(
+            batch, [context], [tokens], 0, 20261018, bos_token_id=bos_token_id)))
     return path
 
 

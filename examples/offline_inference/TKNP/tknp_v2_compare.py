@@ -17,18 +17,42 @@ def compare(reference, candidate, batch):
     assert set(a) == set(b) and len(a) == batch
     worst_error = worst_relative = 0.0
     minimum_cosine = 1.0
-    compared = 0
+    compared = replicated_copies_checked = non_output_copies = 0
+    manifests = {}
     for key in a:
         assert a[key]['token_ids'] == b[key]['token_ids'], key
         for step in range(len(a[key]['token_ids'])):
             tensors = []
             for stage, request in ((reference, a[key]), (candidate, b[key])):
                 digest = hashlib.sha256(request['server_request_id'].encode()).hexdigest()
-                path = stage / 'engine/server0/full-logits-rank0' / f'{digest}-{step}.pt'
-                record = torch.load(path, map_location='cpu', weights_only=True)
-                assert record['step'] == step and record['request_id'] == request['server_request_id']
-                tensor = record['logits'].float()
-                assert bool(torch.isfinite(tensor).all())
+                paths = sorted((stage/'engine').glob(f'server*/full-logits-rank*/{digest}-{step}.pt'))
+                assert paths, (stage, key, step, paths)
+                tensor = None
+                for path in paths:
+                    server = path.parents[1].name
+                    manifest_path = stage/f'b{batch}'/server/'manifest.json'
+                    if manifest_path not in manifests:
+                        manifests[manifest_path] = {r['rank']: r for r in json.loads(
+                            manifest_path.read_text())['worker_resources']}
+                    rank = int(path.parent.name.removeprefix('full-logits-rank'))
+                    owner = manifests[manifest_path][rank].get('tknp_v2')
+                    if owner and owner['tknp_rank'] != owner['control_rank']:
+                        # Non-output TKNP ranks expose identity-head placeholders.
+                        # Their status is verified from recorded topology, not values.
+                        non_output_copies += 1
+                        continue
+                    record = torch.load(path, map_location='cpu', weights_only=True)
+                    assert record['step'] == step and record['request_id'] == request['server_request_id']
+                    copy = record['logits'].float()
+                    assert bool(torch.isfinite(copy).all())
+                    if tensor is None:
+                        tensor = copy
+                    else:
+                        # TP ranks may each record the same all-gathered logits.
+                        # Validate every replica rather than picking one blindly.
+                        assert torch.equal(tensor, copy), ('Replicated TP logits disagree', path)
+                        replicated_copies_checked += 1
+                assert tensor is not None, ('No real output-owner logits', stage, key, step)
                 tensors.append(tensor)
             x, y = tensors
             relative = float((x-y).norm() / x.norm().clamp_min(1e-12))
@@ -40,6 +64,8 @@ def compare(reference, candidate, batch):
             minimum_cosine = min(minimum_cosine, cosine)
             compared += 1
     return dict(passed=True, batch=batch, logit_vectors=compared,
+                replicated_logit_copies_checked=replicated_copies_checked,
+                non_output_rank_placeholders_excluded=non_output_copies,
                 max_absolute_error=worst_error, max_relative_l2=worst_relative,
                 min_cosine=minimum_cosine, all_tokens_equal=True,
                 reference=str(reference), candidate=str(candidate),

@@ -37,7 +37,6 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -53,6 +52,12 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import NemotronConfig
+from vllm.distributed.parallel_state import is_tknp_initialized, get_tknp_rank
+from vllm.distributed.tknp_layer_ownership import (
+    enabled as tknp_v2_enabled, current_owners, owner_for_prefix)
+from vllm.model_executor.layers.token_parallel_linear import (
+    TokenParallelQKVLinear, TokenParallelRowLinear, init_tknp_layer,
+    tknp_block_handoff)
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
@@ -108,6 +113,12 @@ class NemotronLayerNorm1P(nn.LayerNorm):
             return x if residual is None else (x, residual)
 
 
+NemotronLayerNorm1P = init_tknp_layer(NemotronLayerNorm1P)
+VocabParallelEmbedding = init_tknp_layer(VocabParallelEmbedding)
+ParallelLMHead = init_tknp_layer(ParallelLMHead)
+
+
+@init_tknp_layer
 class NemotronMLP(nn.Module):
     def __init__(
         self,
@@ -180,7 +191,7 @@ class NemotronAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = TokenParallelQKVLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
@@ -189,7 +200,7 @@ class NemotronAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = TokenParallelRowLinear(
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias,
@@ -263,10 +274,12 @@ class NemotronDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = NemotronLayerNorm1P(
-            config.hidden_size, eps=config.norm_eps
+            config.hidden_size, eps=config.norm_eps,
+            _tknp_owner_rank=owner_for_prefix(prefix)
         )
         self.post_attention_layernorm = NemotronLayerNorm1P(
-            config.hidden_size, eps=config.norm_eps
+            config.hidden_size, eps=config.norm_eps,
+            _tknp_owner_rank=owner_for_prefix(prefix)
         )
 
     def forward(
@@ -292,7 +305,13 @@ class NemotronDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-@support_torch_compile
+def nemotron_model_invariants(input_ids, positions, intermediate_tensors=None,
+                              inputs_embeds=None):
+    if input_ids is not None:
+        torch._check(positions.size()[0] == input_ids.size()[0])
+
+
+@support_torch_compile(shape_invariants=nemotron_model_invariants)
 class NemotronModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -303,6 +322,7 @@ class NemotronModel(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
+        self.tknp_layer_owners = current_owners() if is_tknp_initialized() else None
 
         self.vocab_size = config.vocab_size
 
@@ -354,8 +374,20 @@ class NemotronModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        previous_owner = 0
+        for index, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer),
+                                      self.start_layer):
+            if self.tknp_layer_owners is not None:
+                owner = self.tknp_layer_owners[index]
+                if owner != previous_owner:
+                    hidden_states, residual = tknp_block_handoff(
+                        hidden_states, residual, previous_owner, owner)
+                previous_owner = owner
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+        if self.tknp_layer_owners is not None and previous_owner != 0:
+            hidden_states, residual = tknp_block_handoff(
+                hidden_states, residual, previous_owner, 0)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -495,5 +527,9 @@ class NemotronForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if is_tknp_initialized() and tknp_v2_enabled():
+            rank = get_tknp_rank()
+            weights = ((name, weight) for name, weight in weights
+                       if owner_for_prefix(name) == rank or '.self_attn.attn.' in name)
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

@@ -97,6 +97,30 @@ def llama_layer_costs(layers, hidden, intermediate, heads, kv_heads, head_dim,
         for i in range(layers))
 
 
+@lru_cache(maxsize=16)
+def nemotron_owners(layers, hidden, intermediate, heads, kv_heads, head_dim,
+                    vocab, tied, weight_bytes, degree, ignored=()):
+    """Nemotron has two MLP matrices and weight+bias LayerNorm1P parameters."""
+    costs = nemotron_layer_costs(layers, hidden, intermediate, heads, kv_heads,
+                                head_dim, weight_bytes, ignored)
+    endpoints = (1 if tied else 2)*vocab*hidden*2 + 2*hidden*2
+    return partition_layers(costs, endpoints, degree)
+
+
+def nemotron_layer_costs(layers, hidden, intermediate, heads, kv_heads, head_dim,
+                         weight_bytes, ignored=()):
+    def width(index, names):
+        prefixes = [f'model.layers.{index}.{name}' for name in names]
+        return 2 if any(p == skip or p.startswith(skip+'.')
+                        for p in prefixes for skip in ignored) else weight_bytes
+    return tuple(
+        hidden*(heads+2*kv_heads)*head_dim*width(i, ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'])
+        + hidden*heads*head_dim*width(i, ['self_attn.o_proj'])
+        + hidden*intermediate*width(i, ['mlp.up_proj'])
+        + hidden*intermediate*width(i, ['mlp.down_proj']) + 4*hidden*2
+        for i in range(layers))
+
+
 def current_owners():
     if not enabled():
         return None
@@ -108,9 +132,10 @@ def current_owners():
     if cfg.cache_config.cache_dtype not in ('auto', 'bfloat16'):
         raise ValueError('First TKNP v2 implementation requires model-precision/BF16 KV')
     hf = cfg.model_config.hf_config
-    if hf.model_type != 'llama':
-        raise ValueError('First TKNP v2 implementation supports Llama only')
-    return llama_owners(hf.num_hidden_layers, hf.hidden_size, hf.intermediate_size,
+    planners = {'llama': llama_owners, 'nemotron': nemotron_owners}
+    if hf.model_type not in planners:
+        raise ValueError('TKNP v2 supports Llama and Nemotron decoder architectures')
+    return planners[hf.model_type](hf.num_hidden_layers, hf.hidden_size, hf.intermediate_size,
                         hf.num_attention_heads, hf.num_key_value_heads,
                         getattr(hf, 'head_dim', hf.hidden_size//hf.num_attention_heads),
                         hf.vocab_size, hf.tie_word_embeddings,
