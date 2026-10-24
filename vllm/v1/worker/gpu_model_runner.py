@@ -1593,6 +1593,13 @@ class GPUModelRunner(
             )
 
         slot_count = int(os.environ.get("VLLM_TKNP_GRAPH_SLOTS", "0"))
+        if os.environ.get("VLLM_TKNP_V2", "0") == "1":
+            # The moving-root prototype uses the local symbolic positions to
+            # derive full-batch handoff shapes. Unequal graph ownership is a
+            # different compilation contract and must not silently fit here.
+            if any(len(set(counts)) != 1 or min(counts) <= 0
+                   for counts in self._tknp_graph_splits.values()):
+                raise ValueError("TKNP v2 FULL graphs require equal positive owner counts")
         if capture_layouts is not None and self.parallel_config.enable_dbo:
             # Capacity fitting can alter a requested cohort's local shapes.
             # Validate the *effective* layouts before any capture threads run.

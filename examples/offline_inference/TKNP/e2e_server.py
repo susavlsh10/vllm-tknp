@@ -463,6 +463,24 @@ def main():
                 "kv_layout": get_kv_cache_layout(),
                 "kv_storage_dtypes": sorted({str(t.dtype) for t in runner.kv_caches if isinstance(t, torch.Tensor)})}
         from vllm.distributed import get_tp_group
+        if os.environ.get("VLLM_TKNP_V2", "0") == "1":
+            from vllm.distributed import get_tknp_rank
+            plans = [m.tknp_layer_owners for m in runner.model.modules()
+                     if getattr(m, "tknp_layer_owners", None) is not None]
+            if not plans or any(p != plans[0] for p in plans):
+                raise RuntimeError("Missing or inconsistent TKNP v2 ownership")
+            import re
+            rank = get_tknp_rank()
+            owned = sorted({int(match.group(1))
+                for name, param in runner.model.named_parameters()
+                if param.numel() and (match := re.search(r"layers\.(\d+)\.", name))
+                and ("mlp." in name or "qkv_proj." in name or "o_proj." in name)})
+            expected = [i for i, owner in enumerate(plans[0]) if owner == rank]
+            if owned != expected:
+                raise RuntimeError(f"TKNP v2 weight placement mismatch: {owned} != {expected}")
+            result["tknp_v2"] = dict(control_rank=0, tknp_rank=rank,
+                layer_owners=list(plans[0]), owned_dense_layers=owned,
+                equal_attention_ownership=True, microbatching=False)
         dc=get_tp_group().device_communicator
         def custom_state(comm):
             return dict(available=comm is not None and not comm.disabled,

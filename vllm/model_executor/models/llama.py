@@ -77,6 +77,9 @@ from .utils import (
 # Token parallel imports
 from vllm.model_executor.layers.token_parallel_linear import TokenParallelQKVLinear, TokenParallelRowLinear, init_tknp_layer
 from vllm.distributed.parallel_state import is_tknp_initialized, is_first_tknp_rank
+from vllm.distributed.tknp_layer_ownership import (
+    enabled as tknp_v2_enabled, current_owners, owner_for_prefix)
+from vllm.model_executor.layers.token_parallel_linear import tknp_block_handoff
 
 RMSNorm = init_tknp_layer(RMSNorm)
 VocabParallelEmbedding = init_tknp_layer(VocabParallelEmbedding)
@@ -336,9 +339,11 @@ class LlamaDecoderLayer(nn.Module):
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps,
+                                      _tknp_owner_rank=owner_for_prefix(prefix))
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps,
+            _tknp_owner_rank=owner_for_prefix(prefix)
         )
 
     def forward(
@@ -391,6 +396,7 @@ class LlamaModel(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
+        self.tknp_layer_owners = current_owners() if is_tknp_initialized() else None
 
         self.vocab_size = config.vocab_size
 
@@ -442,12 +448,23 @@ class LlamaModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
+        previous_owner = 0
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
+            if self.tknp_layer_owners is not None:
+                owner = self.tknp_layer_owners[idx+self.start_layer]
+                if owner != previous_owner:
+                    hidden_states, residual = tknp_block_handoff(
+                        hidden_states, residual, previous_owner, owner)
+                previous_owner = owner
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+        if self.tknp_layer_owners is not None and previous_owner != 0:
+            hidden_states, residual = tknp_block_handoff(
+                hidden_states, residual, previous_owner, 0)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -649,8 +666,14 @@ class LlamaForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         
         # # In token model parallelism, only the first ranks (root) loads weights.
-        if is_tknp_initialized() and not is_first_tknp_rank():
+        if is_tknp_initialized() and not is_first_tknp_rank() and not tknp_v2_enabled():
             return set()
+
+        if tknp_v2_enabled():
+            from vllm.distributed.parallel_state import get_tknp_rank
+            rank = get_tknp_rank()
+            weights = ((name, weight) for name, weight in weights
+                       if owner_for_prefix(name) == rank or '.self_attn.attn.' in name)
         
         loader = AutoWeightsLoader(
             self,

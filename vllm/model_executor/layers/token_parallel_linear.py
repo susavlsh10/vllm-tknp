@@ -2,9 +2,9 @@
 Token Parallel Linear Layers for vLLM.
 
 This module implements token parallel versions of linear layers used in attention.
-In token parallelism, only the root rank (rank 0) in each token parallel group 
-loads weights and computes projections, while other ranks focus on attention 
-computation for their assigned token partitions.
+Legacy token parallelism stores dense weights on rank zero. Opt-in TKNP v2
+places contiguous layer blocks on different TP groups; the static per-layer
+owner computes projections while all groups keep their attention/KV shards.
 """
 
 import torch
@@ -36,6 +36,7 @@ from vllm.forward_context import (
 )
 
 from vllm.logger import init_logger
+from vllm.distributed.tknp_layer_ownership import enabled as tknp_v2_enabled, owner_for_prefix
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
@@ -400,7 +401,76 @@ def _get_tknp_group_by_name(group_name: str):
     return group
 
 
+def _tknp_handoff_impl(hidden: torch.Tensor, residual: torch.Tensor,
+                       dependency: torch.Tensor, rows: int, local_rows: int,
+                       src: int, dst: int, group_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    group = _get_tknp_group_by_name(group_name)
+    comm = _get_pynccl_comm(group)
+    count = rows if comm.rank == dst else local_rows
+    out = hidden.new_empty((count, hidden.shape[-1]))
+    res = residual.new_empty((count, residual.shape[-1]))
+    if _is_tknp_dummy_run():
+        out.zero_(); res.zero_()
+        return out, res
+    md = getattr(get_forward_context(), 'tknp_metadata', None)
+    if md is not None and md.is_cuda_graph:
+        _sync_tknp_capture_comm(group)
+    comm.group_start()
+    if comm.rank == src:
+        comm.send(hidden[:rows].contiguous(), dst)
+        comm.send(residual[:rows].contiguous(), dst)
+    elif comm.rank == dst:
+        comm.recv(out, src)
+        comm.recv(res, src)
+    comm.group_end()
+    if comm.rank != dst:
+        # Values are placeholders, but outputs preserve the cross-layer data
+        # dependency so Dynamo cannot remove a send-only handoff.
+        out.zero_(); res.zero_()
+    return out, res
+
+
+def _tknp_handoff_fake(hidden: torch.Tensor, residual: torch.Tensor,
+                       dependency: torch.Tensor, rows: int, local_rows: int,
+                       src: int, dst: int, group_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.distributed.parallel_state import get_tknp_rank
+    count = rows if get_tknp_rank() == dst else local_rows
+    return hidden.new_empty((count, hidden.shape[-1])), residual.new_empty((count, residual.shape[-1]))
+
+
+def tknp_block_handoff(hidden, residual, src, dst):
+    if src == dst:
+        return hidden, residual
+    md = get_forward_context().tknp_metadata
+    group = get_tknp_group()
+    rows = sum(md.tokens_per_rank)
+    rank = get_tknp_rank()
+    local_rows = md.tokens_per_rank[rank]
+    if rank == 0 and local_rows == 0:
+        local_rows = 1  # Runner's fixed control-rank padding lane.
+    if torch.compiler.is_compiling():
+        # Preserve the runner's symbolic local dimension across block changes.
+        # A concrete metadata count here constrains the next RoPE invocation
+        # against its dynamic positions input and invalidates the FX graph.
+        local_rows = md._compile_local_shape_source.size(-1)
+        # Before this rank owns its first dense block, it has no full-batch
+        # activation input. Equal-owner v2 graph layouts derive that symbolic
+        # global size from the local positions, rather than freezing the first
+        # (largest) capture's Python count into every receive.
+        rows = getattr(md, '_compile_total_tokens',
+                       local_rows * get_tknp_world_size())
+    dependency = getattr(md, '_compile_comm_token', hidden.new_empty(0))
+    hidden, residual = torch.ops.vllm.tknp_handoff(
+        hidden, residual, dependency, rows, local_rows, src, dst, group.unique_name)
+    md._compile_comm_token = hidden
+    return hidden, residual
+
+
 if supports_custom_op():
+    direct_register_custom_op(
+        op_name='tknp_handoff', op_func=_tknp_handoff_impl, mutates_args=[],
+        fake_impl=_tknp_handoff_fake,
+    )
     direct_register_custom_op(
         op_name="tknp_scatter",
         op_func=_tknp_scatter_impl,
@@ -423,7 +493,7 @@ class TokenParallelQKVLinear(QKVParallelLinear):
     """
     QKV projection layer with Token Parallelism.
 
-    Only root rank (rank 0) holds weights and computes the projection.
+    Only the layer's dense owner holds weights and computes the projection.
     The QKV output is then scattered to all ranks via pre-allocated buffers
     and NCCL grouped send/recv for minimal overhead.
     """
@@ -437,7 +507,8 @@ class TokenParallelQKVLinear(QKVParallelLinear):
         self.is_tknp_enabled = is_tknp_initialized()
         self.tknp_rank = get_tknp_rank() if self.is_tknp_enabled else 0
         self.tknp_world_size = get_tknp_world_size() if self.is_tknp_enabled else 1
-        self.is_root_rank = (self.tknp_rank == 0)
+        self.owner_rank = owner_for_prefix(kwargs.get('prefix', '')) if self.is_tknp_enabled else 0
+        self.is_root_rank = (self.tknp_rank == self.owner_rank)
         self.tknp_group = get_tknp_group() if self.is_tknp_enabled else None
         self.tknp_group_name = (self.tknp_group.unique_name
                                 if self.tknp_group is not None else "")
@@ -525,7 +596,7 @@ class TokenParallelQKVLinear(QKVParallelLinear):
 
         tokens_per_rank = metadata.tokens_per_rank
         total_tokens = sum(tokens_per_rank)
-        root_rank = (metadata.root_rank
+        root_rank = self.owner_rank if tknp_v2_enabled() else (metadata.root_rank
                      if metadata.root_rank is not None else 0)
 
         # ---- validation (root only) ----------------------------------
@@ -579,7 +650,7 @@ class TokenParallelQKVLinear(QKVParallelLinear):
                 qkv_local = x.new_empty(x.size(0), qkv_dim)
         else:
             recv_count = tokens_per_rank[self.tknp_rank]
-            if self.is_root_rank and recv_count == 0:
+            if recv_count == 0 and (self.tknp_rank == 0 if tknp_v2_enabled() else self.is_root_rank):
                 recv_count = 1
             qkv_local = self._buf_pool.get(
                 "qkv_recv", recv_count, qkv_dim, dtype, self.device,
@@ -703,7 +774,8 @@ class TokenParallelRowLinear(RowParallelLinear):
         self.is_tknp_enabled = is_tknp_initialized()
         self.tknp_rank = get_tknp_rank() if self.is_tknp_enabled else 0
         self.tknp_world_size = get_tknp_world_size() if self.is_tknp_enabled else 1
-        self.is_root_rank = (self.tknp_rank == 0)
+        self.owner_rank = owner_for_prefix(kwargs.get('prefix', '')) if self.is_tknp_enabled else 0
+        self.is_root_rank = (self.tknp_rank == self.owner_rank)
         self.tknp_group = get_tknp_group() if self.is_tknp_enabled else None
         self.tknp_group_name = (self.tknp_group.unique_name
                                 if self.tknp_group is not None else "")
@@ -772,7 +844,7 @@ class TokenParallelRowLinear(RowParallelLinear):
             return super().forward(x)
 
         tokens_per_rank = metadata.tokens_per_rank
-        root_rank = (metadata.root_rank
+        root_rank = self.owner_rank if tknp_v2_enabled() else (metadata.root_rank
                      if metadata.root_rank is not None else 0)
         local_count = tokens_per_rank[self.tknp_rank]
         hidden_size = x.size(-1)
@@ -781,7 +853,8 @@ class TokenParallelRowLinear(RowParallelLinear):
         # specializing the dynamic dimension.
         if (not torch.compiler.is_compiling()
                 and x.size(0) != local_count
-                and not (self.is_root_rank and local_count == 0 and x.size(0) == 1)):
+                and not ((self.tknp_rank == 0 if tknp_v2_enabled() else self.is_root_rank)
+                         and local_count == 0 and x.size(0) == 1)):
             logger.warning(
                 "Rank %d: expected %d tokens, got %d – falling back.",
                 self.tknp_rank, local_count, x.size(0),
@@ -945,7 +1018,10 @@ def init_tknp_layer(cls_to_wrap: type) -> type:
             self.is_tknp_enabled = is_tknp_initialized()
             self.tknp_rank = get_tknp_rank() if self.is_tknp_enabled else 0
             self.tknp_world_size = get_tknp_world_size() if self.is_tknp_enabled else 1
-            self.is_root_rank = (self.tknp_rank == 0)
+            explicit_owner = kwargs.pop('_tknp_owner_rank', None)
+            self.owner_rank = (explicit_owner if explicit_owner is not None else
+                               owner_for_prefix(kwargs.get('prefix', ''))) if self.is_tknp_enabled else 0
+            self.is_root_rank = (self.tknp_rank == self.owner_rank)
 
             # 2. If self.is_root_rank is True, setup the regular class.
             if self.is_root_rank:
